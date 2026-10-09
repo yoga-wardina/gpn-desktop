@@ -4,6 +4,7 @@ mod meta_windows;
 mod watcher;
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tauri::{
@@ -11,7 +12,6 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State,
 };
-use tokio::sync::Mutex;
 
 use config::{ConfigStore, GameMeta, MetaCache};
 use watcher::{GameProc, Target};
@@ -44,8 +44,8 @@ fn watched_meta(state: &AppState) -> HashMap<String, Option<GameMeta>> {
 
 fn state_json(state: &State<'_, AppState>) -> serde_json::Value {
     serde_json::json!({
-        "procs": *state.procs.blocking_lock(),
-        "targets": *state.targets.blocking_lock(),
+        "procs": *state.procs.lock().unwrap(),
+        "targets": *state.targets.lock().unwrap(),
         "watched": state.cfg.config.lock().unwrap().games.clone(),
         "gpnServerUrl": state.cfg.config.lock().unwrap().gpn_server_url,
         "meta": watched_meta(state),
@@ -87,7 +87,7 @@ async fn save_settings(app: AppHandle, server_url: String, token: String) -> Res
         let c = state.cfg.config.lock().unwrap();
         (c.gpn_server_url.clone(), c.gpn_token.clone())
     };
-    *state.api.lock().await = api::GpnApi::new(url, tok);
+    *state.api.lock().unwrap() = api::GpnApi::new(url, tok);
     Ok(())
 }
 
@@ -95,7 +95,7 @@ async fn save_settings(app: AppHandle, server_url: String, token: String) -> Res
 async fn ping_server(app: AppHandle) -> Result<String, String> {
     let api = {
         let state = app.state::<AppState>();
-        let guard = state.api.lock().await;
+        let guard = state.api.lock().unwrap();
         guard.clone()
     };
     api.ping().await
@@ -163,21 +163,21 @@ async fn watcher_loop(app: AppHandle) {
         let targets = watcher::connections_for(&procs.iter().map(|p| p.pid).collect::<Vec<_>>());
 
         let changed = {
-            let mut cur = state.targets.blocking_lock();
+            let mut cur = state.targets.lock().unwrap();
             let prev: std::collections::HashSet<_> = cur.iter().map(t_key).collect();
             let new: std::collections::HashSet<_> = targets.iter().map(t_key).collect();
             let changed = prev != new;
             *cur = targets.clone();
             changed
         };
-        *state.procs.blocking_lock() = procs;
+        *state.procs.lock().unwrap() = procs;
 
         let _ = app.emit("gpn-state", state_json(&state));
 
         if changed && !targets.is_empty() {
             let api = {
                 let s = app.state::<AppState>();
-                let guard = s.api.lock().await;
+                let guard = s.api.lock().unwrap();
                 guard.clone()
             };
             let t = targets.clone();
