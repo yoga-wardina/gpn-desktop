@@ -143,20 +143,33 @@ async fn resolve_meta_inner(app: &AppHandle, exe: &str) {
 }
 
 /// Background loop: poll processes + connections, emit state, push to VPS.
+/// Body wrapped in catch_unwind so any panic (e.g. from OS command parsing)
+/// logs and retries instead of killing the app.
 async fn watcher_loop(app: AppHandle) {
     loop {
+        let result = tokio::spawn({
+            let app = app.clone();
+            std::panic::AssertUnwindSafe(watcher_tick(app))
+        });
+        match result.await {
+            Ok(()) => {}
+            Err(e) => log::error!("watcher tick panicked: {e}"),
+        }
         let poll = {
             let state = app.state::<AppState>();
             let cfg = state.cfg.config.lock().unwrap();
             cfg.poll_interval_ms
         };
         tokio::time::sleep(Duration::from_millis(poll)).await;
+    }
+}
 
+async fn watcher_tick(app: AppHandle) {
         let state = app.state::<AppState>();
         let watched = state.cfg.config.lock().unwrap().games.clone();
         if watched.is_empty() {
             let _ = app.emit("gpn-state", state_json(&state));
-            continue;
+            return;
         }
 
         let procs = watcher::find_processes(&watched);
@@ -187,7 +200,6 @@ async fn watcher_loop(app: AppHandle) {
                 }
             });
         }
-    }
 }
 
 fn t_key(t: &Target) -> String {
