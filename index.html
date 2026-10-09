@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GPN Client</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div class="topbar">
+      <div class="logo">GPN<span>CLIENT</span></div>
+      <div class="status-pill"><div class="dot" id="dot"></div><span id="statusText">connecting…</span></div>
+    </div>
+    <div class="wrap">
+      <h2>Watched Games</h2>
+      <div class="add-row">
+        <input id="exeInput" placeholder="Game executable path (e.g. D:\SteamLibrary\...\AION2.exe)" />
+        <button class="btn primary" id="watchBtn">Watch</button>
+      </div>
+      <div id="games" style="margin-top:12px"></div>
+
+      <h2>Live Server Targets</h2>
+      <table>
+        <thead><tr><th>Protocol</th><th>IP</th><th>Port</th></tr></thead>
+        <tbody id="targets"><tr><td colspan="3" class="empty">No game traffic detected yet.</td></tr></tbody>
+      </table>
+
+      <h2>Settings</h2>
+      <div class="card settings" style="display:block">
+        <input id="serverUrl" placeholder="GPN server URL (e.g. https://gpn.example.com)" />
+        <input id="token" placeholder="Auth token" type="password" />
+        <div class="row">
+          <button class="btn primary" id="saveBtn">Save</button>
+          <button class="btn" id="pingBtn">Test connection</button>
+          <span id="pingResult" style="align-self:center;font-size:13px"></span>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
