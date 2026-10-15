@@ -1,15 +1,21 @@
-//! Process watcher: finds watched game processes and lists their remote
-//! connections. Windows: tasklist + netstat -nao. Linux: ps + ss.
+//! Process watcher: finds watched game processes and lists their TCP connections.
+//! Windows: tasklist + netstat -nao. Linux: ps + ss. UDP comes from ETW (see etw.rs);
+//! netstat cannot report a UDP remote address.
 
 use std::collections::HashSet;
-use std::process::Command;
+use std::net::Ipv4Addr;
 
 use serde::Serialize;
+
+use crate::net::is_public_ipv4;
+use crate::proc::command;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GameProc {
     pub pid: u32,
     pub name: String,
+    /// watched-entry key this process belongs to (lowercase exe file name)
+    pub game: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -20,35 +26,36 @@ pub struct Target {
     pub proto: String,
 }
 
+/// Key of a watched entry: its lowercase file name ("D:\\x\\AION2.exe" -> "aion2.exe").
+pub fn game_key(entry: &str) -> String {
+    entry.rsplit(['\\', '/']).next().unwrap_or(entry).trim().to_lowercase()
+}
+
+/// Image names are truncated by tasklist (25 chars) / ps (15): accept a truncated prefix.
+fn name_matches(proc_name_lc: &str, key: &str) -> bool {
+    proc_name_lc == key || (proc_name_lc.len() >= 15 && key.starts_with(proc_name_lc))
+}
+
 fn run_cmd(cmd: &str, args: &[&str]) -> String {
-    Command::new(cmd)
+    command(cmd)
         .args(args)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
 }
 
-/// Find PIDs+names of processes whose image name contains any watched entry.
+/// Find running processes matching any watched entry (by file name).
 pub fn find_processes(watched: &[String]) -> Vec<GameProc> {
-    let watched_lc: Vec<String> = watched.iter().map(|w| w.to_lowercase()).collect();
-    if watched_lc.is_empty() {
+    let keys: Vec<String> = watched.iter().map(|w| game_key(w)).filter(|k| !k.is_empty()).collect();
+    if keys.is_empty() {
         return Vec::new();
     }
 
-    if cfg!(windows) {
+    let rows: Vec<(String, u32)> = if cfg!(windows) {
         let out = run_cmd("tasklist", &["/FO", "CSV", "/NH"]);
         parse_csv_rows(&out)
             .into_iter()
-            .filter_map(|row| {
-                let name = row.first()?.to_string();
-                let pid: u32 = row.get(1)?.trim().parse().ok()?;
-                Some((name, pid))
-            })
-            .filter(|(name, _)| {
-                let n = name.to_lowercase();
-                watched_lc.iter().any(|w| n.contains(w.as_str()))
-            })
-            .map(|(name, pid)| GameProc { pid, name })
+            .filter_map(|row| Some((row.first()?.to_string(), row.get(1)?.trim().parse().ok()?)))
             .collect()
     } else {
         let out = run_cmd("ps", &["-eo", "pid,comm"]);
@@ -57,19 +64,21 @@ pub fn find_processes(watched: &[String]) -> Vec<GameProc> {
             .filter_map(|line| {
                 let mut it = line.trim().split_whitespace();
                 let pid: u32 = it.next()?.parse().ok()?;
-                let name = it.collect::<Vec<_>>().join(" ");
-                Some((pid, name))
+                Some((it.collect::<Vec<_>>().join(" "), pid))
             })
-            .filter(|(_, name)| {
-                let n = name.to_lowercase();
-                watched_lc.iter().any(|w| n.contains(w.as_str()))
-            })
-            .map(|(pid, name)| GameProc { pid, name })
             .collect()
-    }
+    };
+
+    rows.into_iter()
+        .filter_map(|(name, pid)| {
+            let lc = name.to_lowercase();
+            let game = keys.iter().find(|k| name_matches(&lc, k))?.clone();
+            Some(GameProc { pid, name, game })
+        })
+        .collect()
 }
 
-/// List remote (ip, port, proto) for the given PIDs.
+/// Established TCP connections of the given PIDs to public IPv4 hosts.
 pub fn connections_for(pids: &[u32]) -> Vec<Target> {
     if pids.is_empty() {
         return Vec::new();
@@ -78,52 +87,25 @@ pub fn connections_for(pids: &[u32]) -> Vec<Target> {
     let mut out = Vec::new();
 
     if cfg!(windows) {
-        let out_s = run_cmd("netstat", &["-nao"]);
-        for line in out_s.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 5 {
-                continue;
-            }
-            let (proto_s, remote, pid_s) = (parts[0], parts[2], parts[4]);
-            let Ok(pid) = pid_s.parse::<u32>() else { continue };
-            if !wanted.contains(&pid) {
-                continue;
-            }
-            let proto = if proto_s.to_lowercase().starts_with("udp") {
-                "udp"
-            } else if proto_s.to_lowercase().starts_with("tcp") {
-                "tcp"
-            } else {
-                continue;
-            };
-            if let Some(t) = parse_remote(remote, proto) {
+        for line in run_cmd("netstat", &["-nao"]).lines() {
+            if let Some(t) = parse_netstat_line(line, &wanted) {
                 out.push(t);
             }
         }
     } else {
-        let out_s = run_cmd("ss", &["-tunap"]);
-        for line in out_s.lines().skip(1) {
-            let pid = match line.find("pid=") {
-                Some(i) => {
-                    let rest = &line[i + 4..];
-                    let digits: String =
-                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                    match digits.parse::<u32>() {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    }
-                }
-                None => continue,
-            };
+        for line in run_cmd("ss", &["-tunap"]).lines().skip(1) {
+            let Some(i) = line.find("pid=") else { continue };
+            let digits: String = line[i + 4..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let Ok(pid) = digits.parse::<u32>() else { continue };
             if !wanted.contains(&pid) {
                 continue;
             }
+            // Netid State Recv-Q Send-Q Local Peer Process
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 5 {
+            if parts.len() < 6 || parts[1] != "ESTAB" {
                 continue;
             }
-            let proto = if parts[0] == "udp" { "udp" } else { "tcp" };
-            if let Some(t) = parse_remote(parts[4], proto) {
+            if let Some(t) = parse_remote(parts[5], if parts[0] == "udp" { "udp" } else { "tcp" }) {
                 out.push(t);
             }
         }
@@ -131,24 +113,33 @@ pub fn connections_for(pids: &[u32]) -> Vec<Target> {
     out
 }
 
-/// "1.2.3.4:5678" or "[::1]:80" -> Target
-fn parse_remote(remote: &str, proto: &str) -> Option<Target> {
-    let (ip, port_str) = if let Some(stripped) = remote.strip_prefix('[') {
-        let close = stripped.find(']')?;
-        (&stripped[..close], &stripped[close + 2..])
-    } else {
-        let idx = remote.rfind(':')?;
-        (&remote[..idx], &remote[idx + 1..])
-    };
-    if ip.is_empty() || ip == "0.0.0.0" || ip == "::" || ip == "*" {
+// States that mean "not an active connection". Windows localizes state names, so on other
+// locales nothing is excluded here and only the remote-port check in parse_remote applies.
+const DEAD_STATES: [&str; 8] = ["TIME_WAIT", "CLOSE_WAIT", "FIN_WAIT_1", "FIN_WAIT_2", "LAST_ACK", "CLOSING", "SYN_SENT", "SYN_RECEIVED"];
+
+/// `  TCP    192.168.1.5:50000    203.0.113.9:443    ESTABLISHED    1234`
+/// (UDP rows have no state column => 4 fields, skipped.)
+fn parse_netstat_line(line: &str, wanted: &HashSet<u32>) -> Option<Target> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 5 || !parts[0].eq_ignore_ascii_case("tcp") {
         return None;
     }
-    let port = port_str.parse().ok();
-    Some(Target {
-        ip: ip.to_string(),
-        port,
-        proto: proto.into(),
-    })
+    let pid: u32 = parts[4].parse().ok()?;
+    if !wanted.contains(&pid) || DEAD_STATES.contains(&parts[3].to_uppercase().as_str()) {
+        return None;
+    }
+    parse_remote(parts[2], "tcp")
+}
+
+/// "1.2.3.4:5678" -> Target (public IPv4 only; IPv6 and LISTENING rows are dropped).
+fn parse_remote(remote: &str, proto: &str) -> Option<Target> {
+    let idx = remote.rfind(':')?;
+    let ip: Ipv4Addr = remote[..idx].parse().ok()?;
+    let port: u16 = remote[idx + 1..].parse().ok()?;
+    if port == 0 || !is_public_ipv4(ip) {
+        return None;
+    }
+    Some(Target { ip: ip.to_string(), port: Some(port), proto: proto.into() })
 }
 
 /// Windows CSV rows: "a","b",...
@@ -184,4 +175,34 @@ fn parse_csv_rows(text: &str) -> Vec<Vec<String>> {
         rows.push(row);
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_and_matching() {
+        assert_eq!(game_key(r"D:\SteamLibrary\AION2.exe"), "aion2.exe");
+        assert_eq!(game_key("AION2.exe"), "aion2.exe");
+        assert!(name_matches("aion2.exe", "aion2.exe"));
+        assert!(!name_matches("aion2.exe.mui", "aion2.exe"));
+        // truncated image name
+        assert!(name_matches("verylongexecutablename", "verylongexecutablename.exe"));
+        assert!(!name_matches("short", "shortlonger.exe"));
+    }
+
+    #[test]
+    fn netstat_rows() {
+        let wanted: HashSet<u32> = [1234].into();
+        let ok = parse_netstat_line("  TCP    192.168.1.5:50000    8.8.4.4:443    ESTABLISHED    1234", &wanted).unwrap();
+        assert_eq!((ok.ip.as_str(), ok.port), ("8.8.4.4", Some(443)));
+        // listening, private, dead state, other pid, udp
+        assert!(parse_netstat_line("  TCP    0.0.0.0:135    0.0.0.0:0    LISTENING    1234", &wanted).is_none());
+        assert!(parse_netstat_line("  TCP    192.168.1.5:50000    192.168.1.9:445    ESTABLISHED    1234", &wanted).is_none());
+        assert!(parse_netstat_line("  TCP    192.168.1.5:50000    8.8.4.4:443    TIME_WAIT    1234", &wanted).is_none());
+        assert!(parse_netstat_line("  TCP    192.168.1.5:50000    8.8.4.4:443    ESTABLISHED    99", &wanted).is_none());
+        assert!(parse_netstat_line("  UDP    0.0.0.0:5353    *:*    1234", &wanted).is_none());
+        assert!(parse_netstat_line("  TCP    [::1]:50000    [2001:db8::1]:443    ESTABLISHED    1234", &wanted).is_none());
+    }
 }

@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::AuthSession;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub gpn_server_url: String,
@@ -14,6 +16,19 @@ pub struct Config {
     pub games: Vec<String>,
     #[serde(default)]
     pub game_ports: Vec<u16>,
+    /// Tear the tunnel down after ~60s without game traffic.
+    #[serde(default = "yes")]
+    pub tunnel_teardown_when_idle: bool,
+    /// Persistent WireGuard private key (keeps the same peer identity across restarts).
+    #[serde(default)]
+    pub wg_private_key: Option<String>,
+    /// Logged-in user session.
+    #[serde(default)]
+    pub auth: Option<AuthSession>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_poll() -> u64 {
@@ -28,6 +43,9 @@ impl Default for Config {
             poll_interval_ms: default_poll(),
             games: Vec::new(),
             game_ports: Vec::new(),
+            tunnel_teardown_when_idle: true,
+            wg_private_key: None,
+            auth: None,
         }
     }
 }
@@ -49,6 +67,8 @@ impl ConfigStore {
             config: std::sync::Mutex::new(config),
         };
         store.persist();
+        // holds tokens and the WG private key: current user + SYSTEM only (best effort)
+        crate::proc::restrict_file(&store.path, &[&crate::proc::current_user(), "*S-1-5-18"]);
         store
     }
 

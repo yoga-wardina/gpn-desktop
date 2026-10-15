@@ -13,6 +13,38 @@
       <div class="status-pill"><div class="dot" id="dot"></div><span id="statusText">connecting…</span></div>
     </div>
     <div class="wrap">
+      <h2>Account &amp; Tunnel</h2>
+      <div class="card" style="display:block">
+        <div id="insecureWarn" class="sub" style="display:none;color:var(--red);margin-bottom:10px">
+          ⚠ Server URL is not https — your password will cross the network in clear text.
+        </div>
+        <div id="loggedOut" class="settings" style="display:block">
+          <input id="authUser" placeholder="Username" autocomplete="username" />
+          <input id="authPass" placeholder="Password" type="password" autocomplete="current-password" />
+          <input id="authInvite" placeholder="Invite code (register only, if the server requires one)" />
+          <div class="row">
+            <button class="btn primary" id="loginBtn">Log in</button>
+            <button class="btn" id="registerBtn">Register</button>
+            <span id="authMsg" style="align-self:center;font-size:13px"></span>
+          </div>
+        </div>
+        <div id="loggedIn" class="row" style="display:none;align-items:center">
+          <div><div class="name" id="authName"></div><div class="sub" id="authRole"></div></div>
+          <button class="btn" id="logoutBtn">Log out</button>
+        </div>
+        <div class="row" style="align-items:center;margin-top:14px">
+          <span class="tag udp" id="tunnelTag">tunnel</span>
+          <span class="sub" id="tunnelInfo"></span>
+        </div>
+        <div class="sub mono" id="tunnelRoutes" style="margin-top:8px"></div>
+        <div class="sub" id="tunnelErr" style="margin-top:8px;color:var(--red)"></div>
+        <p class="sub" style="margin-top:10px">
+          The tunnel needs WireGuard for Windows installed and this app running as administrator. Saved
+          profiles of a running game are routed as soon as the game starts; it is torn down ~60s after
+          the last game traffic and when you quit.
+        </p>
+      </div>
+
       <h2>Watched Games</h2>
       <div class="add-row">
         <input id="exeInput" placeholder="Game executable path (e.g. D:\SteamLibrary\...\AION2.exe)" />
@@ -26,10 +58,43 @@
         <tbody id="targets"><tr><td colspan="3" class="empty">No game traffic detected yet.</td></tr></tbody>
       </table>
 
+      <h2>Learn Mode</h2>
+      <div class="card learn" style="display:block">
+        <div class="row" style="align-items:center">
+          <span class="tag udp" id="etwTag">ETW</span>
+          <span class="sub" id="etwMsg"></span>
+          <button class="btn" id="etwAdminBtn" style="display:none">Relaunch as admin</button>
+          <button class="btn" id="etwRetryBtn" style="display:none">Retry</button>
+        </div>
+        <div class="row" style="align-items:center;margin-top:12px">
+          <select id="learnGame"></select>
+          <button class="btn primary" id="learnToggle">Start learning</button>
+          <button class="btn" id="learnClear">Clear</button>
+          <span class="sub" id="learnInfo"></span>
+        </div>
+        <p class="sub" style="margin-top:10px">
+          While learning, every public server the watched game talks to (TCP and UDP) is recorded with
+          its traffic, play sessions and network (AS / BGP prefix). Play a few sessions, tick the real
+          game servers, and save them as a profile. Hosts seen across several sessions with sustained
+          traffic are the game servers; one-off hosts are usually CDNs, telemetry or voice chat.
+        </p>
+      </div>
+      <table>
+        <thead><tr><th></th><th>Proto</th><th>Host</th><th>Ports</th><th>Traffic</th><th>Sessions</th><th>Network</th><th>Route as</th></tr></thead>
+        <tbody id="learnRows"><tr><td colspan="8" class="empty">Watch a game to start learning its servers.</td></tr></tbody>
+      </table>
+      <div class="row learn" style="margin-top:12px;align-items:center">
+        <button class="btn primary" id="saveProfileBtn">Save profile</button>
+        <span id="profileMsg" style="font-size:13px"></span>
+      </div>
+
+      <h2>Saved Profiles</h2>
+      <div id="profiles"></div>
+
       <h2>Settings</h2>
       <div class="card settings" style="display:block">
         <input id="serverUrl" placeholder="GPN server URL (e.g. https://gpn.example.com)" />
-        <input id="token" placeholder="Auth token" type="password" />
+        <input id="token" placeholder="Machine token (optional fallback when not logged in; blank = keep)" type="password" />
         <div class="row">
           <button class="btn primary" id="saveBtn">Save</button>
           <button class="btn" id="pingBtn">Test connection</button>

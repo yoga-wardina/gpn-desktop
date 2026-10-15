@@ -13,26 +13,25 @@ pub fn resolve(exe_path: &str) -> Option<ExeMeta> {
     if !cfg!(windows) || !exe_path.contains('\\') && !exe_path.contains('/') {
         return None;
     }
-    let script = format!(
-        r#"$ErrorActionPreference='Stop'
-$f = Get-Item -LiteralPath '{path}'
+    // the path is passed via the environment, never interpolated into the script (no injection)
+    let script = r#"$ErrorActionPreference='Stop'
+$f = Get-Item -LiteralPath $env:GPN_EXE
 $v = $f.VersionInfo
 $i = $null
-try {{
+try {
   Add-Type -AssemblyName System.Drawing
   $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($f.FullName)
-  if ($ico) {{
+  if ($ico) {
     $ms = New-Object System.IO.MemoryStream
     $ico.ToBitmap().Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     $i = [Convert]::ToBase64String($ms.ToArray())
-  }}
-}} catch {{}}
-@{{ name = @($v.FileDescription, $v.ProductName) | Where-Object {{ $_ }} | Select-Object -First 1; company = $v.CompanyName; icon = $i }} | ConvertTo-Json -Compress"#,
-        path = exe_path.replace('\'', "''")
-    );
+  }
+} catch {}
+@{ name = @($v.FileDescription, $v.ProductName) | Where-Object { $_ } | Select-Object -First 1; company = $v.CompanyName; icon = $i } | ConvertTo-Json -Compress"#;
 
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+    let out = crate::proc::command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("GPN_EXE", exe_path)
         .output()
         .ok()?;
     if !out.status.success() {

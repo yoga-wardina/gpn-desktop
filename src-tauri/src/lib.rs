@@ -1,34 +1,66 @@
 mod api;
+mod asn;
 mod config;
+mod etw;
+mod learn;
 mod meta_windows;
+mod net;
+mod proc;
+mod profiles;
+mod routing;
+mod tunnel;
 mod watcher;
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State,
 };
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use config::{ConfigStore, GameMeta, MetaCache};
-use watcher::{GameProc, Target};
+use etw::{EtwHandle, EtwStatus, FlowEvent, PidMap, Proto};
+use learn::{Learn, LearnView};
+use routing::{desired_routes, Desired, Router};
+use tunnel::TunnelManager;
+use profiles::{Profile, ProfileEntry, ProfileStore};
+use watcher::{game_key, GameProc, Target};
+
+/// ETW flows (UDP has no "connection") count as live targets for this long after the last packet.
+const LIVE_FLOW_TTL: Duration = Duration::from_secs(15);
+const MAX_TARGETS: usize = 200;
+
+struct EtwSlot {
+    status: EtwStatus,
+    handle: Option<EtwHandle>,
+}
 
 struct AppState {
-    cfg: ConfigStore,
+    cfg: Arc<ConfigStore>,
     meta: MetaCache,
-    api: Mutex<api::GpnApi>,
+    api: Arc<api::GpnApi>,
+    tunnel: Arc<TunnelManager>,
+    router: Arc<Router>,
     targets: Mutex<Vec<Target>>,
     procs: Mutex<Vec<GameProc>>,
+    /// pid -> game key for the running watched games (read by the ETW callback)
+    pids: PidMap,
+    /// recent ETW flows of watched games
+    live: Mutex<HashMap<(Proto, Ipv4Addr, u16), Instant>>,
+    running_games: Mutex<HashSet<String>>,
+    learn: Learn,
+    profiles: ProfileStore,
+    etw: Mutex<EtwSlot>,
+    etw_tx: UnboundedSender<FlowEvent>,
 }
 
 fn meta_key(exe: &str) -> String {
-    std::path::Path::new(exe)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_else(|| exe.to_lowercase())
+    game_key(exe)
 }
 
 fn watched_meta(state: &AppState) -> HashMap<String, Option<GameMeta>> {
@@ -42,13 +74,19 @@ fn watched_meta(state: &AppState) -> HashMap<String, Option<GameMeta>> {
         .collect()
 }
 
-fn state_json(state: &State<'_, AppState>) -> serde_json::Value {
+fn state_json(state: &AppState) -> serde_json::Value {
     serde_json::json!({
         "procs": *state.procs.lock().unwrap(),
         "targets": *state.targets.lock().unwrap(),
         "watched": state.cfg.config.lock().unwrap().games.clone(),
         "gpnServerUrl": state.cfg.config.lock().unwrap().gpn_server_url,
         "meta": watched_meta(state),
+        "etw": state.etw.lock().unwrap().status,
+        "learning": state.learn.enabled(),
+        "auth": state.api.auth_info(),
+        "hasToken": state.api.has_credentials(),
+        "insecureUrl": !api::is_secure_or_local(&state.api.server_url()),
+        "tunnel": state.tunnel.view(),
     })
 }
 
@@ -77,28 +115,128 @@ async fn unwatch_game(app: AppHandle, exe: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn save_settings(app: AppHandle, server_url: String, token: String) -> Result<(), String> {
+async fn save_settings(app: AppHandle, server_url: String, token: Option<String>) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let url = api::normalize_url(&server_url);
     state.cfg.update(|c| {
-        c.gpn_server_url = server_url;
-        c.gpn_token = token;
+        c.gpn_server_url = url.clone();
+        if let Some(t) = &token {
+            c.gpn_token = t.clone();
+        }
     });
-    let (url, tok) = {
-        let c = state.cfg.config.lock().unwrap();
-        (c.gpn_server_url.clone(), c.gpn_token.clone())
-    };
-    *state.api.lock().unwrap() = api::GpnApi::new(url, tok);
+    state.api.set_server(&url);
+    if let Some(t) = token {
+        state.api.set_token(&t);
+    }
     Ok(())
 }
 
 #[tauri::command]
-async fn ping_server(app: AppHandle) -> Result<String, String> {
-    let api = {
-        let state = app.state::<AppState>();
-        let guard = state.api.lock().unwrap();
-        guard.clone()
-    };
+async fn ping_server(state: State<'_, AppState>) -> Result<String, String> {
+    let api = state.api.clone();
     api.ping().await
+}
+
+#[tauri::command]
+async fn auth_login(state: State<'_, AppState>, username: String, password: String) -> Result<api::AuthInfo, String> {
+    let api = state.api.clone();
+    api.login(username.trim(), &password).await
+}
+
+#[tauri::command]
+async fn auth_register(state: State<'_, AppState>, username: String, password: String, invite_code: Option<String>) -> Result<api::AuthInfo, String> {
+    let api = state.api.clone();
+    api.register_user(username.trim(), &password, invite_code.as_deref().map(str::trim)).await
+}
+
+/// Log out and drop the tunnel (it belongs to the user's peer).
+#[tauri::command]
+async fn auth_logout(state: State<'_, AppState>) -> Result<(), String> {
+    state.tunnel.teardown(true).await;
+    state.api.logout().await;
+    Ok(())
+}
+
+// ===== learn mode / profiles / ETW commands =====
+
+#[tauri::command]
+fn get_learn(state: State<'_, AppState>, game: String) -> LearnView {
+    state.learn.snapshot(&game_key(&game))
+}
+
+#[tauri::command]
+fn set_learning(state: State<'_, AppState>, enabled: bool) {
+    state.learn.set_enabled(enabled);
+}
+
+#[tauri::command]
+fn clear_learn(state: State<'_, AppState>, game: String) {
+    state.learn.clear(&game_key(&game));
+}
+
+#[tauri::command]
+fn save_profile(state: State<'_, AppState>, game: String, name: Option<String>, entries: Vec<ProfileEntry>) -> Result<Profile, String> {
+    let key = game_key(&game);
+    let name = name
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| state.meta.get(&key).map(|m| m.name))
+        .unwrap_or_else(|| key.clone());
+    state.profiles.save(&key, &name, entries)
+}
+
+#[tauri::command]
+fn get_profiles(state: State<'_, AppState>) -> Vec<Profile> {
+    state.profiles.list()
+}
+
+#[tauri::command]
+fn delete_profile(state: State<'_, AppState>, game: String) {
+    state.profiles.delete(&game_key(&game));
+}
+
+#[tauri::command]
+fn export_profile(state: State<'_, AppState>, game: String) -> Result<String, String> {
+    state.profiles.export(&game_key(&game))
+}
+
+#[tauri::command]
+fn etw_restart(state: State<'_, AppState>) -> EtwStatus {
+    start_etw(&state);
+    state.etw.lock().unwrap().status.clone()
+}
+
+/// ETW needs elevation: start a new elevated instance (UAC prompt) and exit this one.
+#[tauri::command]
+fn relaunch_as_admin(app: AppHandle) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let script = "Start-Process -FilePath $env:GPN_SELF -Verb RunAs";
+    proc::command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("GPN_SELF", exe)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    // give the elevated instance a moment to start before this one releases the ETW session
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        handle.exit(0);
+    });
+    Ok(())
+}
+
+fn start_etw(state: &AppState) {
+    let mut slot = state.etw.lock().unwrap();
+    slot.handle = None; // stop any previous session first
+    match etw::start(state.etw_tx.clone(), state.pids.clone()) {
+        Ok(h) => {
+            slot.handle = Some(h);
+            slot.status = EtwStatus::running();
+        }
+        Err(status) => {
+            log::warn!("ETW unavailable: {}", status.message);
+            slot.status = status;
+        }
+    }
 }
 
 async fn resolve_meta_inner(app: &AppHandle, exe: &str) {
@@ -142,6 +280,64 @@ async fn resolve_meta_inner(app: &AppHandle, exe: &str) {
     state.meta.insert(key, resolved);
 }
 
+// ===== background tasks =====
+
+/// ETW events -> live flow table (targets) + learn mode.
+async fn flow_consumer(app: AppHandle, mut rx: UnboundedReceiver<FlowEvent>) {
+    while let Some(ev) = rx.recv().await {
+        let state = app.state::<AppState>();
+        let game = state.pids.read().unwrap().get(&ev.pid).cloned();
+        let Some(game) = game else { continue };
+        {
+            let mut live = state.live.lock().unwrap();
+            if live.len() < 5000 {
+                live.insert((ev.proto, ev.remote_ip, ev.remote_port), Instant::now());
+            } else if let Some(t) = live.get_mut(&(ev.proto, ev.remote_ip, ev.remote_port)) {
+                *t = Instant::now();
+            }
+        }
+        state.learn.record(&game, &ev);
+    }
+}
+
+/// Batches IPs from learn mode into Team Cymru bulk lookups.
+async fn asn_worker(app: AppHandle, mut rx: UnboundedReceiver<String>) {
+    while let Some(first) = rx.recv().await {
+        tokio::time::sleep(Duration::from_millis(800)).await; // let a burst accumulate
+        let mut batch = vec![first];
+        while batch.len() < 100 {
+            match rx.try_recv() {
+                Ok(ip) => batch.push(ip),
+                Err(_) => break,
+            }
+        }
+        batch.sort();
+        batch.dedup();
+        let state = app.state::<AppState>();
+        match asn::lookup(&batch).await {
+            Ok(results) => state.learn.apply_asn(&batch, results),
+            Err(e) => {
+                log::warn!("ASN lookup failed: {e}");
+                state.learn.apply_asn(&batch, Vec::new()); // retried later by the maintenance loop
+            }
+        }
+    }
+}
+
+/// Periodic persistence + retry of failed ASN lookups.
+async fn maintenance_loop(app: AppHandle) {
+    let mut n: u32 = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let state = app.state::<AppState>();
+        state.learn.flush();
+        n += 1;
+        if n % 12 == 0 {
+            state.learn.retry_missing_asn();
+        }
+    }
+}
+
 /// Background loop: poll processes + connections, emit state, push to VPS.
 /// Body wrapped in catch_unwind so any panic (e.g. from OS command parsing)
 /// logs and retries instead of killing the app.
@@ -165,50 +361,65 @@ async fn watcher_loop(app: AppHandle) {
 }
 
 async fn watcher_tick(app: AppHandle) {
-        let state = app.state::<AppState>();
-        let watched = state.cfg.config.lock().unwrap().games.clone();
-        if watched.is_empty() {
-            let _ = app.emit("gpn-state", state_json(&state));
-            return;
-        }
+    let state = app.state::<AppState>();
+    state.live.lock().unwrap().retain(|_, t| t.elapsed() < LIVE_FLOW_TTL);
 
-        let procs = watcher::find_processes(&watched);
-        let targets = watcher::connections_for(&procs.iter().map(|p| p.pid).collect::<Vec<_>>());
-
-        let changed = {
-            let mut cur = state.targets.lock().unwrap();
-            let prev: std::collections::HashSet<_> = cur.iter().map(t_key).collect();
-            let new: std::collections::HashSet<_> = targets.iter().map(t_key).collect();
-            let changed = prev != new;
-            *cur = targets.clone();
-            changed
-        };
-        *state.procs.lock().unwrap() = procs;
-
+    let watched = state.cfg.config.lock().unwrap().games.clone();
+    if watched.is_empty() {
+        state.router.update(Desired::default());
         let _ = app.emit("gpn-state", state_json(&state));
+        return;
+    }
 
-        if changed && !targets.is_empty() {
-            let api = {
-                let s = app.state::<AppState>();
-                let guard = s.api.lock().unwrap();
-                guard.clone()
-            };
-            let t = targets.clone();
-            tokio::spawn(async move {
-                if let Err(e) = api.push_targets(&t).await {
-                    log::warn!("push failed: {e}");
-                }
-            });
+    // tasklist/netstat are blocking: keep them off the async runtime threads
+    let (procs, tcp) = tauri::async_runtime::spawn_blocking(move || {
+        let procs = watcher::find_processes(&watched);
+        let tcp = watcher::connections_for(&procs.iter().map(|p| p.pid).collect::<Vec<_>>());
+        (procs, tcp)
+    })
+    .await
+    .unwrap_or_default();
+
+    // tell the ETW callback which PIDs to report, and start a learn session when a game launches
+    {
+        let mut m = state.pids.write().unwrap();
+        m.clear();
+        for p in &procs {
+            m.insert(p.pid, p.game.clone());
         }
-}
+    }
+    {
+        let now_running: HashSet<String> = procs.iter().map(|p| p.game.clone()).collect();
+        let mut prev = state.running_games.lock().unwrap();
+        for g in now_running.difference(&prev) {
+            state.learn.begin_session(g);
+        }
+        *prev = now_running;
+    }
 
-fn t_key(t: &Target) -> String {
-    format!(
-        "{}:{}:{}",
-        t.proto,
-        t.ip,
-        t.port.map(|p| p.to_string()).unwrap_or_default()
-    )
+    // targets = established TCP (netstat) + recent ETW flows (TCP and UDP)
+    let mut targets = tcp;
+    if !procs.is_empty() {
+        let live = state.live.lock().unwrap();
+        for (proto, ip, port) in live.keys() {
+            targets.push(Target { ip: ip.to_string(), port: Some(*port), proto: proto.as_str().into() });
+        }
+    }
+    targets.sort_by(|a, b| (&a.proto, &a.ip, a.port).cmp(&(&b.proto, &b.ip, b.port)));
+    targets.dedup_by(|a, b| a.proto == b.proto && a.ip == b.ip && a.port == b.port);
+    targets.truncate(MAX_TARGETS);
+
+    *state.targets.lock().unwrap() = targets.clone();
+    *state.procs.lock().unwrap() = procs;
+
+    let _ = app.emit("gpn-state", state_json(&state));
+
+    // pre-route saved profiles of running games + live hosts; the router applies it
+    {
+        let running: HashSet<String> = state.procs.lock().unwrap().iter().map(|p| p.game.clone()).collect();
+        let live: Vec<Ipv4Addr> = targets.iter().filter_map(|t| t.ip.parse().ok()).collect();
+        state.router.update(desired_routes(&state.profiles.list(), &running, &live));
+    }
 }
 
 fn show_main(app: &AppHandle) {
@@ -255,21 +466,52 @@ pub fn run() {
             let handle = app.handle().clone();
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir).ok();
-            let cfg = ConfigStore::new(&data_dir);
+            let cfg = Arc::new(ConfigStore::new(&data_dir));
             let meta = MetaCache::new(&data_dir);
-            let api = api::GpnApi::new(
-                cfg.config.lock().unwrap().gpn_server_url.clone(),
-                cfg.config.lock().unwrap().gpn_token.clone(),
-            );
+            let api = {
+                let c = cfg.config.lock().unwrap().clone();
+                let sink_cfg = cfg.clone();
+                Arc::new(api::GpnApi::new(&c.gpn_server_url, &c.gpn_token, c.auth, Box::new(move |s| sink_cfg.update(|c| c.auth = s))))
+            };
+            let tunnel = Arc::new(TunnelManager::new(api.clone(), cfg.clone()));
+            let router = Router::new(tunnel.clone());
+
+            let (flow_tx, flow_rx) = tokio::sync::mpsc::unbounded_channel::<FlowEvent>();
+            let (asn_tx, asn_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let learn = Learn::new(&data_dir);
+            learn.set_asn_sender(asn_tx);
+
             app.manage(AppState {
-                cfg,
+                cfg: cfg.clone(),
                 meta,
-                api: Mutex::new(api),
+                api,
+                tunnel: tunnel.clone(),
+                router: router.clone(),
                 targets: Mutex::new(Vec::new()),
                 procs: Mutex::new(Vec::new()),
+                pids: Arc::new(RwLock::new(HashMap::new())),
+                live: Mutex::new(HashMap::new()),
+                running_games: Mutex::new(HashSet::new()),
+                learn,
+                profiles: ProfileStore::new(&data_dir),
+                etw: Mutex::new(EtwSlot { status: EtwStatus::off(), handle: None }),
+                etw_tx: flow_tx,
             });
 
+            start_etw(&handle.state::<AppState>());
+            tauri::async_runtime::spawn(flow_consumer(handle.clone(), flow_rx));
+            tauri::async_runtime::spawn(asn_worker(handle.clone(), asn_rx));
+            tauri::async_runtime::spawn(maintenance_loop(handle.clone()));
             tauri::async_runtime::spawn(watcher_loop(handle.clone()));
+            {
+                let t = tunnel.clone();
+                tauri::async_runtime::spawn(async move {
+                    t.init().await; // adopt a tunnel left running by a previous run
+                    t.watchdog().await;
+                });
+                let c = cfg.clone();
+                tauri::async_runtime::spawn(router.run(move || c.config.lock().unwrap().tunnel_teardown_when_idle));
+            }
             setup_tray(&handle)?;
             Ok(())
         })
@@ -278,8 +520,28 @@ pub fn run() {
             watch_game,
             unwatch_game,
             save_settings,
-            ping_server
+            ping_server,
+            auth_login,
+            auth_register,
+            auth_logout,
+            get_learn,
+            set_learning,
+            clear_learn,
+            save_profile,
+            get_profiles,
+            delete_profile,
+            export_profile,
+            etw_restart,
+            relaunch_as_admin
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                let state = app.state::<AppState>();
+                state.learn.flush();
+                // don't leave the VPN running headless
+                tauri::async_runtime::block_on(state.tunnel.teardown(false));
+            }
+        });
 }

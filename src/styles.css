@@ -72,3 +72,11 @@ td.mono, .mono { font-family: Consolas, monospace; }
 }
 .row { display: flex; gap: 8px; }
 .empty { color: var(--dim); font-size: 13px; padding: 18px; text-align: center; }
+.learn .btn, .learn button { margin-left: 0; }
+select {
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); padding: 8px 10px; font-size: 13px; outline: none; min-width: 180px;
+}
+select:focus { border-color: var(--accent); }
+td .sub { font-size: 11px; color: var(--dim); }
+input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; }
