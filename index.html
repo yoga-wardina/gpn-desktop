@@ -18,6 +18,7 @@
         </div>
         <div class="win-btns">
           <button id="winMin" aria-label="Minimize"><svg class="i" viewBox="0 0 10 10"><path d="M0 5h10"/></svg></button>
+          <button id="winMax" aria-label="Full window" title="Full window (F11)"><svg class="i" viewBox="0 0 10 10" id="winMaxIcon"><rect x=".5" y=".5" width="9" height="9"/></svg></button>
           <button id="winClose" class="close" aria-label="Close"><svg class="i" viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10"/></svg></button>
         </div>
       </header>
@@ -28,6 +29,7 @@
           <nav class="nav" aria-label="Main">
             <button class="nav-item" data-nav="dashboard"><svg class="i" data-icon="dashboard"></svg><span class="label">Dashboard</span></button>
             <button class="nav-item" data-nav="games"><svg class="i" data-icon="gamepad"></svg><span class="label">Games</span><span class="pip" id="navGamesPip" hidden></span></button>
+            <button class="nav-item" data-nav="traffic"><svg class="i" data-icon="activity"></svg><span class="label">Traffic</span></button>
             <button class="nav-item" data-nav="learn"><svg class="i" data-icon="crosshair"></svg><span class="label">Learn</span><span class="pip rec" id="navLearnPip" hidden></span></button>
             <button class="nav-item" data-nav="profiles"><svg class="i" data-icon="folder"></svg><span class="label">Profiles</span></button>
             <button class="nav-item" data-nav="settings"><svg class="i" data-icon="sliders"></svg><span class="label">Settings</span></button>
@@ -91,6 +93,37 @@
               <div class="list" id="gameList"></div>
             </section>
 
+            <!-- ───── traffic ───── -->
+            <section class="view" id="view-traffic">
+              <div class="page-head">
+                <h1>Traffic</h1>
+                <div class="actions"><button class="btn" id="trReset">Reset counters</button></div>
+              </div>
+              <div id="trBanner"></div>
+              <div class="card pad">
+                <div class="row" style="margin-bottom:14px">
+                  <div style="width:260px"><select id="trGame" aria-label="Game"></select></div>
+                  <span class="chip dot" id="trState"></span>
+                  <span class="grow"></span>
+                  <span class="chip dot tcp">Download</span><span class="chip dot udp">Upload</span>
+                  <div class="seg" id="trRange" role="group" aria-label="Chart range">
+                    <button data-range="60" aria-pressed="false">1 min</button>
+                    <button data-range="120" aria-pressed="true">2 min</button>
+                    <button data-range="300" aria-pressed="false">5 min</button>
+                  </div>
+                </div>
+                <div class="stats" id="trStats" style="margin-top:0"></div>
+                <div class="chart" id="trChart"></div>
+              </div>
+              <div class="group-title">Servers <span class="count" id="trHostCount"></span></div>
+              <div class="table">
+                <table>
+                  <thead><tr><th>Server</th><th>Downloaded</th><th>Uploaded</th><th>Share</th><th>Route</th><th>Last active</th></tr></thead>
+                  <tbody id="trHosts"></tbody>
+                </table>
+              </div>
+            </section>
+
             <!-- ───── learn ───── -->
             <section class="view" id="view-learn">
               <div class="page-head"><h1>Learn servers</h1></div>
@@ -111,6 +144,17 @@
                   <span class="chip dot plain" id="recChip" style="margin-left:6px"></span>
                 </p>
               </div>
+              <div class="group-title">Timeline <span class="count" id="tlInfo"></span></div>
+              <div class="card pad">
+                <div class="row" style="margin-bottom:12px">
+                  <select id="tlSession" style="width:220px" aria-label="Play session"></select>
+                  <label class="row small dim" style="gap:8px"><input type="checkbox" id="tlMinor"> Show minor hosts</label>
+                  <span class="grow"></span>
+                  <span class="small dim" id="tlSpan"></span>
+                </div>
+                <div id="tlBody"></div>
+              </div>
+
               <div class="group-title">Servers seen <span class="count" id="reviewInfo"></span></div>
               <div class="table">
                 <table>

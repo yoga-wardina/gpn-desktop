@@ -4,6 +4,7 @@ mod config;
 mod etw;
 mod learn;
 mod meta_windows;
+mod monitor;
 mod net;
 mod proc;
 mod profiles;
@@ -26,6 +27,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use config::{ConfigStore, GameMeta, MetaCache};
 use etw::{EtwHandle, EtwStatus, FlowEvent, PidMap, Proto};
 use learn::{Learn, LearnView};
+use monitor::{Monitor, TrafficView};
 use routing::{desired_routes, Desired, Router};
 use tunnel::TunnelManager;
 use profiles::{Profile, ProfileEntry, ProfileStore};
@@ -54,6 +56,8 @@ struct AppState {
     live: Mutex<HashMap<(Proto, Ipv4Addr, u16), Instant>>,
     running_games: Mutex<HashSet<String>>,
     learn: Learn,
+    /// per-game bandwidth + server breakdown (always on, independent of learn mode)
+    monitor: Monitor,
     profiles: ProfileStore,
     etw: Mutex<EtwSlot>,
     etw_tx: UnboundedSender<FlowEvent>,
@@ -158,6 +162,17 @@ async fn auth_logout(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 // ===== learn mode / profiles / ETW commands =====
+
+/// Live bandwidth, session totals and per-server breakdown for one game (all its processes).
+#[tauri::command]
+fn get_traffic(state: State<'_, AppState>, game: String, window_secs: Option<usize>) -> TrafficView {
+    state.monitor.snapshot(&game_key(&game), window_secs.unwrap_or(120))
+}
+
+#[tauri::command]
+fn reset_traffic(state: State<'_, AppState>, game: String) {
+    state.monitor.begin_session(&game_key(&game));
+}
 
 #[tauri::command]
 fn get_learn(state: State<'_, AppState>, game: String) -> LearnView {
@@ -309,6 +324,7 @@ async fn flow_consumer(app: AppHandle, mut rx: UnboundedReceiver<FlowEvent>) {
                 *t = Instant::now();
             }
         }
+        state.monitor.record(&game, &ev);
         state.learn.record(&game, &ev);
     }
 }
@@ -406,6 +422,7 @@ async fn watcher_tick(app: AppHandle) {
         let mut prev = state.running_games.lock().unwrap();
         for g in now_running.difference(&prev) {
             state.learn.begin_session(g);
+            state.monitor.begin_session(g);
         }
         *prev = now_running;
     }
@@ -510,6 +527,7 @@ pub fn run() {
                 live: Mutex::new(HashMap::new()),
                 running_games: Mutex::new(HashSet::new()),
                 learn,
+                monitor: Monitor::default(),
                 profiles: ProfileStore::new(&data_dir),
                 etw: Mutex::new(EtwSlot { status: EtwStatus::off(), handle: None }),
                 etw_tx: flow_tx,
@@ -551,6 +569,8 @@ pub fn run() {
             auth_register,
             auth_logout,
             get_learn,
+            get_traffic,
+            reset_traffic,
             set_learning,
             clear_learn,
             save_profile,

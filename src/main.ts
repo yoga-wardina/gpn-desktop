@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
@@ -32,8 +33,12 @@ interface State {
   tunnel: TunnelView;
 }
 interface Asn { asn: number; prefix: string; cc: string; name: string }
+interface Episode { session: number; first: number; last: number }
 interface LearnEntry {
   ip: string;
+  first_seen: number;
+  last_seen: number;
+  episodes: Episode[];
   proto: string;
   ports: Record<string, number>;
   bytes_out: number;
@@ -43,7 +48,21 @@ interface LearnEntry {
   total_bytes: number;
   suggested: boolean;
 }
-interface LearnView { learning: boolean; sessions: number; entries: LearnEntry[] }
+interface HostTraffic { ip: string; proto: string; port: number; rx: number; tx: number; last_age_ms: number }
+interface TrafficView {
+  active: boolean;
+  started_ms: number;
+  total_rx: number;
+  total_tx: number;
+  peak_rx: number;
+  peak_tx: number;
+  rx_per_sec: number;
+  tx_per_sec: number;
+  series_rx: number[];
+  series_tx: number[];
+  hosts: HostTraffic[];
+}
+interface LearnView { learning: boolean; sessions: number; session_starts: { session: number; started: number }[]; entries: LearnEntry[] }
 interface ProfileEntry {
   cidr: string;
   proto: string;
@@ -55,8 +74,8 @@ interface ProfileEntry {
 }
 interface Profile { version: number; game: string; name: string; updated: number; entries: ProfileEntry[] }
 
-type View = "dashboard" | "games" | "learn" | "profiles" | "settings";
-const VIEWS: View[] = ["dashboard", "games", "learn", "profiles", "settings"];
+type View = "dashboard" | "games" | "traffic" | "learn" | "profiles" | "settings";
+const VIEWS: View[] = ["dashboard", "games", "traffic", "learn", "profiles", "settings"];
 
 // ───────────────────────── helpers ─────────────────────────
 
@@ -88,6 +107,7 @@ const ICONS: Record<string, string> = {
   download: '<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>',
   logout: '<path d="M15 4h4a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-4M10 8l-4 4 4 4M6 12h10"/>',
   login: '<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4M14 8l4 4-4 4M18 12H8"/>',
+  activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
   radar: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><path d="M12 12l6-6"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
 };
@@ -210,6 +230,7 @@ function setView(v: View) {
   $("main").scrollTo({ top: 0 });
   if (v === "learn") refreshLearn();
   if (v === "profiles") refreshProfiles();
+  if (v === "traffic") void refreshTraffic();
 }
 
 // ───────────────────────── rendering ─────────────────────────
@@ -384,7 +405,8 @@ function renderLearnRows() {
   const entries = lastLearn?.entries ?? [];
   $("mSessions").textContent = String(lastLearn?.sessions ?? 0);
   $("mHosts").textContent = String(entries.length);
-  $("reviewInfo").textContent = entries.length ? String(entries.length) : "";
+  const fresh = entries.filter(isNew).length;
+  $("reviewInfo").textContent = entries.length ? `${entries.length}${fresh ? ` · ${fresh} new since saved` : ""}` : "";
 
   if (!selectedGame || !entries.length) {
     const rec = S?.learning;
@@ -410,7 +432,7 @@ function renderLearnRows() {
         : '<span class="faint">looking up…</span>';
       return `<tr class="${st.on ? "picked" : ""}">
         <td><input type="checkbox" class="sel-on" data-k="${esc(k)}" ${st.on ? "checked" : ""} aria-label="Include ${esc(e.ip)}"></td>
-        <td><div class="mono">${esc(e.ip)}</div><div class="sub"><span class="chip ${esc(e.proto)}">${esc(e.proto.toUpperCase())}</span> <span class="mono">${esc(portTxt)}</span></div></td>
+        <td><div class="mono">${esc(e.ip)} ${isNew(e) ? '<span class="chip warn" title="First seen after this game\'s profile was saved">new</span>' : ""}</div><div class="sub"><span class="chip ${esc(e.proto)}">${esc(e.proto.toUpperCase())}</span> <span class="mono">${esc(portTxt)}</span></div></td>
         <td class="num">${fmtBytes(e.total_bytes)}<div class="bar"><i style="width:${Math.max(3, (e.total_bytes / max) * 100)}%"></i></div></td>
         <td class="num">${e.sessions}</td>
         <td>${net}</td>
@@ -425,6 +447,7 @@ function renderLearnRows() {
 }
 
 function updateSaveBar() {
+  renderTimeline();
   const entries = lastLearn?.entries ?? [];
   const n = buildEntries().length;
   $("saveBar").style.display = entries.length ? "flex" : "none";
@@ -434,6 +457,95 @@ function updateSaveBar() {
     ? `Saving replaces the current profile (${plural(existing.entries.length, "server")}).`
     : "Tick the servers that belong to the game.";
   $<HTMLButtonElement>("saveProfileBtn").disabled = n === 0;
+}
+
+const ipToInt = (ip: string) => ip.split(".").reduce((a, b) => ((a << 8) | (parseInt(b, 10) & 255)) >>> 0, 0);
+function cidrContains(cidr: string, ip: string): boolean {
+  const [net, lenStr] = cidr.split("/");
+  const len = parseInt(lenStr ?? "32", 10);
+  if (!net || isNaN(len)) return false;
+  const mask = len === 0 ? 0 : (0xffffffff << (32 - len)) >>> 0;
+  return ((ipToInt(net) & mask) >>> 0) === ((ipToInt(ip) & mask) >>> 0);
+}
+/** Seen for the first time after this game's profile was saved, and not covered by it. */
+function isNew(e: LearnEntry): boolean {
+  const prof = selectedGame ? profileFor(selectedGame) : undefined;
+  if (!prof || e.first_seen <= prof.updated) return false;
+  return !prof.entries.some((p) => (p.proto === "any" || p.proto === e.proto) && cidrContains(p.cidr, e.ip));
+}
+
+const fmtClock = (ms: number) => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+};
+let tlSession = 0;
+let tlMinor = false;
+
+/** When was each server active during one play session? Reveals IP/shard switches. */
+function renderTimeline() {
+  const body = $("tlBody");
+  const sel = $<HTMLSelectElement>("tlSession");
+  const starts = lastLearn?.session_starts ?? [];
+  const entries = lastLearn?.entries ?? [];
+  const withEpisodes = starts.filter((s) => entries.some((e) => (e.episodes ?? []).some((p) => p.session === s.session)));
+
+  if (!withEpisodes.length) {
+    sel.innerHTML = "";
+    sel.disabled = true;
+    $("tlSpan").textContent = "";
+    $("tlInfo").textContent = "";
+    body.innerHTML = `<div class="empty"><div class="ring">${icon("radar")}</div><b>No timeline yet</b>
+      <p>Timeline data is collected from now on while you record. Older recordings only kept first and last seen per server.</p></div>`;
+    return;
+  }
+
+  const sig = withEpisodes.map((s) => s.session).join(",");
+  if (sel.dataset.sig !== sig) {
+    sel.dataset.sig = sig;
+    sel.innerHTML = [...withEpisodes].reverse().map((s) => `<option value="${s.session}">Session ${s.session} · ${esc(new Date(s.started).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }))}</option>`).join("");
+  }
+  sel.disabled = false;
+  if (!withEpisodes.some((s) => s.session === tlSession)) tlSession = withEpisodes[withEpisodes.length - 1]!.session;
+  sel.value = String(tlSession);
+
+  const start = starts.find((s) => s.session === tlSession)!.started;
+  const rows = entries
+    .map((e) => ({ e, eps: (e.episodes ?? []).filter((p) => p.session === tlSession) }))
+    .filter((r) => r.eps.length && (tlMinor || r.e.suggested))
+    .sort((a, b) => a.eps[0]!.first - b.eps[0]!.first);
+  const end = Math.max(start + 60_000, ...entries.flatMap((e) => (e.episodes ?? []).filter((p) => p.session === tlSession).map((p) => p.last)));
+  const dur = end - start;
+
+  $("tlSpan").textContent = `${fmtClock(dur)} long · ${plural(rows.length, "server")}`;
+  $("tlInfo").textContent = "";
+  $<HTMLInputElement>("tlMinor").checked = tlMinor;
+  if (!rows.length) {
+    body.innerHTML = `<div class="empty"><p>Only minor hosts in this session. Tick “Show minor hosts” to see them.</p></div>`;
+    return;
+  }
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => `<span>${fmtClock(dur * f)}</span>`).join("");
+  body.innerHTML =
+    rows
+      .map(({ e, eps }) => {
+        const ports = Object.keys(e.ports).map(Number).sort((a, b) => a - b);
+        const bars = eps
+          .map((p) => {
+            const l = ((p.first - start) / dur) * 100;
+            const w = Math.max(0.5, ((p.last - p.first) / dur) * 100);
+            return `<i class="${esc(e.proto)}" style="left:${l.toFixed(2)}%;width:${w.toFixed(2)}%" title="${fmtClock(p.first - start)} – ${fmtClock(p.last - start)}"></i>`;
+          })
+          .join("");
+        return `<div class="tl-row">
+          <div class="who"><div class="mono">${esc(e.ip)} ${isNew(e) ? '<span class="chip warn">new</span>' : ""}</div>
+            <div class="sub">${esc(e.proto.toUpperCase())} · ${esc(ports.slice(0, 3).join(", "))}</div></div>
+          <div class="tl-track">${bars}</div>
+          <div class="at">+${fmtClock(eps[0]!.first - start)}</div>
+        </div>`;
+      })
+      .join("") + `<div class="tl-axis"><span></span><div>${ticks}</div><span></span></div>`;
 }
 
 async function refreshLearn() {
@@ -465,6 +577,120 @@ function buildEntries(): ProfileEntry[] {
     }
   }
   return out;
+}
+
+// ───────────────────────── traffic monitor ─────────────────────────
+
+let trGame = "";
+let trRange = 120;
+let lastTraffic: TrafficView | null = null;
+const fmtRate = (b: number) => `${fmtBytes(Math.round(b))}/s`;
+const niceMax = (v: number) => {
+  const steps = [1, 2, 5];
+  let m = 1024;
+  for (;;) for (const s of steps) { if (v <= m * s / 1) return m * s; if (s === 5) m *= 10; }
+};
+const ago = (ms: number) => (ms < 5000 ? "now" : ms < 60000 ? `${Math.round(ms / 1000)}s ago` : `${Math.round(ms / 60000)}m ago`);
+
+async function refreshTraffic() {
+  if (view !== "traffic" || !S) return;
+  if (!S.watched.includes(trGame)) trGame = S.watched.find((g) => isRunning(S!, g)) ?? S.watched[0] ?? "";
+  const select = $<HTMLSelectElement>("trGame");
+  const sig = S.watched.join("|") + "#" + S.watched.map((g) => gameName(S!, g)).join("|");
+  if (select.dataset.sig !== sig) {
+    select.dataset.sig = sig;
+    select.innerHTML = S.watched.map((exe) => `<option value="${esc(exe)}">${esc(gameName(S!, exe))}</option>`).join("");
+  }
+  select.value = trGame;
+  select.disabled = !S.watched.length;
+  if (!trGame) {
+    lastTraffic = null;
+  } else {
+    try {
+      lastTraffic = await invoke<TrafficView>("get_traffic", { game: trGame, windowSecs: trRange });
+    } catch (e) {
+      console.error(e);
+      return;
+    }
+  }
+  renderTraffic();
+}
+
+function renderTraffic() {
+  const s = S;
+  if (!s) return;
+  const t = lastTraffic;
+  const running = !!trGame && isRunning(s, trGame);
+
+  let banner = "";
+  if (!s.watched.length) {
+    banner = `<div class="banner warn"><div class="grow"><b>Add a game first.</b> Traffic is measured per watched game.</div><button class="btn sm" data-go="games">Go to Games</button></div>`;
+  } else if (s.etw.state === "denied") {
+    banner = `<div class="banner err"><div class="grow"><b>Traffic capture needs administrator rights.</b> Without it no bytes can be counted.</div><button class="btn sm" data-act="admin">Relaunch as admin</button></div>`;
+  } else if (s.etw.state !== "running") {
+    banner = `<div class="banner warn"><div class="grow"><b>Traffic capture isn't running.</b> ${esc(s.etw.message)}</div><button class="btn sm" data-act="etw-retry">Retry</button></div>`;
+  }
+  $("trBanner").innerHTML = banner;
+
+  const state = $("trState");
+  state.className = "chip dot " + (!running ? "" : t?.active ? "ok live" : "warn");
+  state.textContent = !trGame ? "No game" : !running ? "Not running" : t?.active ? "Active" : "Running — no traffic yet";
+
+  const routed = new Set(s.tunnel.allowedIps);
+  const hostBytes = (t?.hosts ?? []).reduce((a, h) => a + h.rx + h.tx, 0);
+  const viaBytes = (t?.hosts ?? []).filter((h) => routed.has(h.ip)).reduce((a, h) => a + h.rx + h.tx, 0);
+  const via = hostBytes ? Math.round((viaBytes / hostBytes) * 100) : 0;
+  const tile = (k: string, v: string, sub: string) => `<div class="stat"><div class="k">${k}</div><div class="v">${esc(v)}</div><div class="s">${esc(sub)}</div></div>`;
+  $("trStats").innerHTML = [
+    tile("Download", t ? fmtRate(t.rx_per_sec) : "—", t ? `peak ${fmtRate(t.peak_rx)}` : ""),
+    tile("Upload", t ? fmtRate(t.tx_per_sec) : "—", t ? `peak ${fmtRate(t.peak_tx)}` : ""),
+    tile("Downloaded", t ? fmtBytes(t.total_rx) : "—", t?.started_ms ? `since ${new Date(t.started_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "this session"),
+    tile("Uploaded", t ? fmtBytes(t.total_tx) : "—", hostBytes ? `${via}% of traffic via GPN` : "this session"),
+  ].join("");
+
+  drawChart(t);
+
+  $("trHostCount").textContent = t?.hosts.length ? String(t.hosts.length) : "";
+  $("trHosts").innerHTML = t?.hosts.length
+    ? t.hosts
+        .map((h) => {
+          const share = hostBytes ? ((h.rx + h.tx) / hostBytes) * 100 : 0;
+          return `<tr>
+            <td><div class="mono">${esc(h.ip)}</div><div class="sub"><span class="chip ${esc(h.proto)}">${esc(h.proto.toUpperCase())}</span> <span class="mono">${h.port}</span></div></td>
+            <td class="num">${fmtBytes(h.rx)}</td>
+            <td class="num">${fmtBytes(h.tx)}</td>
+            <td class="num">${share.toFixed(share < 10 ? 1 : 0)}%<div class="bar"><i style="width:${Math.max(2, share)}%"></i></div></td>
+            <td>${routed.has(h.ip) ? '<span class="chip dot ok">via GPN</span>' : '<span class="chip">direct</span>'}</td>
+            <td class="dim">${h.last_age_ms < 5000 ? '<span class="chip dot ok live">active</span>' : esc(ago(h.last_age_ms))}</td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="6"><div class="empty"><div class="ring">${icon("activity")}</div><b>${running ? "Waiting for traffic…" : "No data yet"}</b>
+        <p>${running ? "Servers show up here as soon as the game sends or receives data." : "Launch the game and its traffic is measured automatically — no recording needed."}</p></div></td></tr>`;
+}
+
+/** Two series as an area/line chart on an auto-scaled axis. */
+function drawChart(t: TrafficView | null) {
+  const el = $("trChart");
+  const rx = t?.series_rx ?? [];
+  const tx = t?.series_tx ?? [];
+  if (!t || rx.length < 2) {
+    el.innerHTML = "";
+    return;
+  }
+  const W = 600, H = 150;
+  const max = niceMax(Math.max(...rx, ...tx, 1));
+  const x = (i: number) => ((i / (rx.length - 1)) * W).toFixed(1);
+  const y = (v: number) => (H - 4 - (v / max) * (H - 10)).toFixed(1);
+  const line = (a: number[]) => a.map((v, i) => `${i ? "L" : "M"}${x(i)},${y(v)}`).join(" ");
+  const grid = [0.25, 0.5, 0.75].map((f) => `<line class="grid" x1="0" x2="${W}" y1="${(H * f).toFixed(1)}" y2="${(H * f).toFixed(1)}"/>`).join("");
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Traffic over time">
+      ${grid}<line class="grid" x1="0" x2="${W}" y1="${H - 4}" y2="${H - 4}"/>
+      <path class="rx-area" d="${line(rx)} L${W},${H - 4} L0,${H - 4} Z"/>
+      <path class="rx-line" d="${line(rx)}"/><path class="tx-line" d="${line(tx)}"/></svg>
+    <span class="ylab">${esc(fmtRate(max))}</span>
+    <span class="xlab"><span>−${esc(fmtClock(rx.length * 1000))}</span><span>−${esc(fmtClock((rx.length / 2) * 1000))}</span><span>now</span></span>`;
+  el.classList.add("chart-wrap-pad");
 }
 
 // ───────────────────────── profiles ─────────────────────────
@@ -664,8 +890,61 @@ function nativeFeel() {
 
 async function windowChrome() {
   const win = getCurrentWindow();
+  // The window is fixed-size in normal mode. "Full window" temporarily allows resizing, maximizes,
+  // and on the way back restores the fixed size (keep NORMAL in sync with tauri.conf.json).
+  const NORMAL = { w: 1280, h: 820 };
+  const maxIcon = $("winMaxIcon");
+  let full = false;
+  const paintFull = () => {
+    maxIcon.innerHTML = full ? '<path d="M2.5.5h7v7M.5 2.5h7v7h-7z"/>' : '<rect x=".5" y=".5" width="9" height="9"/>';
+    $("winMax").setAttribute("aria-label", full ? "Exit full window" : "Full window");
+    $("winMax").title = full ? "Exit full window (F11)" : "Full window (F11)";
+  };
+  let busy = false;
+  const toggleFull = async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      if (!full) {
+        await win.setResizable(true);
+        await win.maximize();
+        full = true;
+      } else {
+        await win.unmaximize();
+        await win.setResizable(false);
+        await win.setSize(new LogicalSize(NORMAL.w, NORMAL.h));
+        full = false;
+      }
+    } catch (e) {
+      toast(errText(e), "err");
+    } finally {
+      paintFull();
+      busy = false;
+    }
+  };
   $("winMin").addEventListener("click", () => void win.minimize());
-  $("winClose").addEventListener("click", () => void win.close());
+  $("winMax").addEventListener("click", () => void toggleFull());
+  // leave full-window mode first so the saved window position is the normal one, not the maximized one
+  $("winClose").addEventListener("click", async () => {
+    if (full) await win.unmaximize().catch(() => {});
+    void win.close();
+  });
+  // F11 toggles; double-clicking the titlebar does the same (replacing Tauri's built-in
+  // double-click-to-maximize, which doesn't work on a non-resizable window)
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "F11") { e.preventDefault(); void toggleFull(); }
+  });
+  window.addEventListener(
+    "mousedown",
+    (e) => {
+      if (e.detail === 2 && (e.target as HTMLElement).closest("[data-tauri-drag-region]")) {
+        e.stopImmediatePropagation();
+        void toggleFull();
+      }
+    },
+    true
+  );
+  paintFull();
 
   // drag an .exe onto the window to watch it
   const veil = $("dropVeil");
@@ -736,6 +1015,31 @@ function wire() {
   $("exeInput").addEventListener("keydown", (e) => (e as KeyboardEvent).key === "Enter" && $("watchBtn").click());
 
   // learn
+  $("trGame").addEventListener("change", () => {
+    trGame = $<HTMLSelectElement>("trGame").value;
+    void refreshTraffic();
+  });
+  $("trRange").addEventListener("click", (ev) => {
+    const b = (ev.target as HTMLElement).closest<HTMLButtonElement>("button[data-range]");
+    if (!b) return;
+    trRange = parseInt(b.dataset.range!, 10);
+    $("trRange").querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    void refreshTraffic();
+  });
+  $("trReset").addEventListener("click", async () => {
+    if (!trGame) return;
+    await invoke("reset_traffic", { game: trGame });
+    toast("Counters reset");
+    void refreshTraffic();
+  });
+  $("tlSession").addEventListener("change", () => {
+    tlSession = parseInt($<HTMLSelectElement>("tlSession").value, 10);
+    renderTimeline();
+  });
+  $("tlMinor").addEventListener("change", () => {
+    tlMinor = $<HTMLInputElement>("tlMinor").checked;
+    renderTimeline();
+  });
   $("learnGame").addEventListener("change", () => {
     selectedGame = $<HTMLSelectElement>("learnGame").value;
     void refreshLearn();
@@ -864,6 +1168,7 @@ async function boot() {
   void refreshProfiles();
   setInterval(refresh, 3000);
   setInterval(refreshLearn, 3000);
+  setInterval(() => void refreshTraffic(), 1000);
 }
 
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => void boot());

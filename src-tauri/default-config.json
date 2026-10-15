@@ -1,0 +1,9 @@
+{
+  "gpn_server_url": "https://gpn.fuckitweball.online",
+  "poll_interval_ms": 2000,
+  "games": [
+    "D:\\SteamLibrary\\steamapps\\common\\AION2\\Aion2\\Binaries\\Win64\\AION2.exe"
+  ],
+  "game_ports": [],
+  "tunnel_teardown_when_idle": true
+}

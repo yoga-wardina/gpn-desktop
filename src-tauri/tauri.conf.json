@@ -15,15 +15,15 @@
       {
         "label": "main",
         "title": "GPN Client",
-        "width": 1000,
-        "height": 680,
+        "width": 1280,
+        "height": 820,
         "decorations": false,
         "shadow": true,
         "center": true,
         "backgroundColor": "#0a0e0a",
         "dragDropEnabled": true,
         "resizable": false,
-        "maximizable": false
+        "maximizable": true
       }
     ],
     "security": {

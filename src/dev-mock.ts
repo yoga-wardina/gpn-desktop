@@ -73,7 +73,31 @@ const learnData: Record<string, any> = {
   },
 };
 
+// synthetic timeline: 3 sessions; a second game server shows up mid-session 3, after the profile was saved
+{
+  const MIN = 60_000, now = Date.now();
+  const starts = [now - 190 * MIN, now - 95 * MIN, now - 32 * MIN];
+  const d = learnData["aion2.exe"];
+  d.session_starts = starts.map((t, i) => ({ session: i + 1, started: t }));
+  const ep = (s: number, a: number, b: number) => ({ session: s, first: starts[s - 1] + a * MIN, last: starts[s - 1] + b * MIN });
+  const by: Record<string, any[]> = {
+    "203.0.113.50": [ep(1, 0, 28), ep(2, 1, 40), ep(3, 0, 11)],
+    "198.51.100.7": [ep(1, 0, 27), ep(2, 0, 41), ep(3, 0, 31)],
+    "52.84.12.9": [ep(1, 3, 5), ep(1, 14, 15), ep(2, 6, 8), ep(3, 20, 22)],
+    "34.120.5.5": [ep(3, 9, 10)],
+    "1.1.1.1": [ep(1, 0, 1)],
+  };
+  for (const e of d.entries) { e.episodes = by[e.ip] ?? []; e.first_seen = now - 190 * MIN; e.last_seen = now; }
+  d.entries.push({ ip: "203.0.113.77", proto: "tcp", ports: { 13328: 20300 }, bytes_out: 600_000, bytes_in: 1_900_000, sessions: 1, total_bytes: 2_500_000, suggested: true,
+    first_seen: starts[2] + 11 * MIN, last_seen: now, episodes: [ep(3, 11, 31)], asn: { asn: 8075, prefix: "20.192.0.0/10", cc: "KR", name: "MICROSOFT-CORP-MSN-AS-BLOCK" } });
+  d.sessions = 3;
+}
+
 let profiles: any[] = scene === "empty" ? [] : [
+  { version: 1, game: "aion2.exe", name: "AION 2", updated: Date.now() - 24 * 60_000, entries: [
+    { cidr: "203.0.113.50/32", proto: "tcp", ports: [], source: "observed", asn: 64500, as_name: "NCSOFT", note: "" },
+    { cidr: "198.51.100.0/22", proto: "tcp", ports: [], source: "prefix", asn: 64500, as_name: "NCSOFT", note: "" },
+  ] },
   { version: 1, game: "valorant.exe", name: "VALORANT", updated: Date.now() - 86_400_000 * 3, entries: [
     { cidr: "162.249.72.0/24", proto: "udp", ports: [], source: "prefix", asn: 6507, as_name: "RIOT", note: "" },
     { cidr: "104.160.131.3/32", proto: "tcp", ports: [443], source: "observed", asn: 6507, as_name: "RIOT", note: "" },
@@ -110,6 +134,24 @@ w.__TAURI_INTERNALS__ = {
       case "auth_register": state.auth = { username: args.username, role: "user" }; return null;
       case "auth_logout": state.auth = null; return null;
       case "get_learn": return structuredClone({ ...(learnData[keyOf(args.game)] ?? { sessions: 0, entries: [] }), learning: state.learning });
+      case "get_traffic": {
+        const n = Math.max(10, args.windowSecs ?? 120);
+        const live = state.procs.length > 0;
+        const t = Date.now() / 1000;
+        const series = (base: number, amp: number) => Array.from({ length: n }, (_, i) => live ? Math.max(0, Math.round(base + amp * Math.sin((t - (n - i)) / 3.1) + (Math.random() - 0.5) * base * 0.5)) : 0);
+        const rx = series(38_000, 22_000), tx = series(5_500, 3_000);
+        const sum = (a: number[]) => a.reduce((x, y) => x + y, 0);
+        if (!live) return { active: false, started_ms: 0, total_rx: 0, total_tx: 0, peak_rx: 0, peak_tx: 0, rx_per_sec: 0, tx_per_sec: 0, series_rx: rx, series_tx: tx, hosts: [] };
+        const hosts = [
+          { ip: "203.0.113.50", proto: "tcp", port: 13328, rx: 84_000_000, tx: 11_000_000, last_age_ms: 400 },
+          { ip: "203.0.113.77", proto: "tcp", port: 13328, rx: 21_000_000, tx: 3_000_000, last_age_ms: 900 },
+          { ip: "198.51.100.7", proto: "tcp", port: 443, rx: 3_100_000, tx: 900_000, last_age_ms: 22_000 },
+          { ip: "52.84.12.9", proto: "tcp", port: 443, rx: 2_200_000, tx: 100_000, last_age_ms: 130_000 },
+        ];
+        return { active: true, started_ms: Date.now() - 26 * 60_000, total_rx: 110_300_000, total_tx: 15_000_000, peak_rx: 310_000, peak_tx: 44_000,
+          rx_per_sec: sum(rx.slice(-3)) / 3, tx_per_sec: sum(tx.slice(-3)) / 3, series_rx: rx, series_tx: tx, hosts };
+      }
+      case "reset_traffic": return null;
       case "set_learning": state.learning = !!args.enabled; return null;
       case "clear_learn": delete learnData[keyOf(args.game)]; return null;
       case "save_profile": {

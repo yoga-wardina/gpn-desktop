@@ -13,6 +13,9 @@ use crate::asn::AsnInfo;
 use crate::etw::FlowEvent;
 
 const MAX_PORTS_PER_HOST: usize = 64;
+/// Silence longer than this ends a host's "episode" (one continuous connection period).
+const EPISODE_GAP_MS: u64 = 60_000;
+const MAX_EPISODES: usize = 100;
 /// Hosts below this much traffic are not pre-selected for the profile.
 const SUGGEST_MIN_BYTES: u64 = 20_000;
 /// Chatter that is never the game server on its own.
@@ -23,6 +26,14 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// One continuous period of traffic with a host inside a play session (epoch ms).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Episode {
+    pub session: u32,
+    pub first: u64,
+    pub last: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +49,9 @@ pub struct Observed {
     pub last_seen: u64,
     /// number of distinct play sessions this host showed up in
     pub sessions: u32,
+    /// when this host was active, per play session (older recordings have none)
+    #[serde(default)]
+    pub episodes: Vec<Episode>,
     #[serde(default)]
     last_session: u32,
 }
@@ -48,6 +62,9 @@ struct GameLearn {
     observed: HashMap<String, Observed>,
     #[serde(default)]
     sessions: u32,
+    /// play session number -> start time (epoch ms)
+    #[serde(default)]
+    session_started: BTreeMap<u32, u64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -76,9 +93,16 @@ pub struct EntryView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SessionStart {
+    pub session: u32,
+    pub started: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct LearnView {
     pub learning: bool,
     pub sessions: u32,
+    pub session_starts: Vec<SessionStart>,
     pub entries: Vec<EntryView>,
 }
 
@@ -115,7 +139,10 @@ impl Learn {
     /// A watched game just started: later hosts count towards a new play session.
     pub fn begin_session(&self, game: &str) {
         let mut d = self.data.lock().unwrap();
-        d.games.entry(game.to_string()).or_default().sessions += 1;
+        let g = d.games.entry(game.to_string()).or_default();
+        g.sessions += 1;
+        let n = g.sessions;
+        g.session_started.insert(n, now_ms());
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -125,6 +152,10 @@ impl Learn {
     }
 
     pub fn record(&self, game: &str, ev: &FlowEvent) {
+        self.record_at(game, ev, now_ms());
+    }
+
+    fn record_at(&self, game: &str, ev: &FlowEvent, now: u64) {
         let ip = ev.remote_ip.to_string();
         let lookup = {
             let mut d = self.data.lock().unwrap();
@@ -136,7 +167,7 @@ impl Learn {
                 g.sessions = 1; // game was already running when the app started
             }
             let session = g.sessions;
-            let now = now_ms();
+            g.session_started.entry(session).or_insert(now);
             let o = g.observed.entry(format!("{}:{}", ev.proto.as_str(), ip)).or_insert_with(|| Observed {
                 ip: ip.clone(),
                 proto: ev.proto.as_str().into(),
@@ -147,6 +178,7 @@ impl Learn {
                 first_seen: now,
                 last_seen: now,
                 sessions: 0,
+                episodes: Vec::new(),
                 last_session: 0,
             });
             if o.ports.contains_key(&ev.remote_port) || o.ports.len() < MAX_PORTS_PER_HOST {
@@ -159,6 +191,15 @@ impl Learn {
             }
             o.packets += 1;
             o.last_seen = now;
+            match o.episodes.last_mut() {
+                Some(e) if e.session == session && now.saturating_sub(e.last) <= EPISODE_GAP_MS => e.last = now,
+                _ => {
+                    if o.episodes.len() >= MAX_EPISODES {
+                        o.episodes.remove(0);
+                    }
+                    o.episodes.push(Episode { session, first: now, last: now });
+                }
+            }
             if o.last_session != session {
                 o.last_session = session;
                 o.sessions += 1;
@@ -209,7 +250,7 @@ impl Learn {
     pub fn snapshot(&self, game: &str) -> LearnView {
         let d = self.data.lock().unwrap();
         let Some(g) = d.games.get(game) else {
-            return LearnView { learning: d.learning, sessions: 0, entries: Vec::new() };
+            return LearnView { learning: d.learning, sessions: 0, session_starts: Vec::new(), entries: Vec::new() };
         };
         let mut entries: Vec<EntryView> = g
             .observed
@@ -232,7 +273,8 @@ impl Learn {
             })
             .collect();
         entries.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        LearnView { learning: d.learning, sessions: g.sessions, entries }
+        let session_starts = g.session_started.iter().map(|(s, t)| SessionStart { session: *s, started: *t }).collect();
+        LearnView { learning: d.learning, sessions: g.sessions, session_starts, entries }
     }
 
     /// Write to disk if anything changed since the last flush.
@@ -287,6 +329,31 @@ mod tests {
         l.flush();
         let reloaded = Learn::new(&dir);
         assert_eq!(reloaded.snapshot("game.exe").entries.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn episodes_track_when_a_host_is_active() {
+        let dir = std::env::temp_dir().join(format!("gpn-learn-test3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let l = Learn::new(&dir);
+        l.set_enabled(true);
+        l.begin_session("game.exe");
+        let t0 = 1_000_000u64;
+        let e = ev("203.0.113.9", 7777, 100, true);
+        l.record_at("game.exe", &e, t0);
+        l.record_at("game.exe", &e, t0 + 10_000); // same episode
+        l.record_at("game.exe", &e, t0 + 200_000); // after a long silence: a new episode
+        l.begin_session("game.exe");
+        l.record_at("game.exe", &e, t0 + 300_000); // next play session: a new episode
+
+        let v = l.snapshot("game.exe");
+        let eps = &v.entries[0].obs.episodes;
+        assert_eq!(eps.len(), 3);
+        assert_eq!((eps[0].session, eps[0].first, eps[0].last), (1, t0, t0 + 10_000));
+        assert_eq!((eps[1].first, eps[1].last), (t0 + 200_000, t0 + 200_000));
+        assert_eq!(eps[2].session, 2);
+        assert_eq!(v.session_starts.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

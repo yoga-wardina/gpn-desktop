@@ -165,7 +165,7 @@ svg.i { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none;
 /* ───────── content ───────── */
 .content { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
 .scroll { flex: 1; overflow-y: auto; padding: 20px 28px 32px; }
-.view { display: none; max-width: 940px; margin: 0 auto; }
+.view { display: none; max-width: 1120px; margin: 0 auto; }
 .view.active { display: block; }
 .page-head { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; min-height: 36px; }
 .page-head h1 { font-size: 22px; font-weight: 600; letter-spacing: -.1px; }
@@ -313,6 +313,30 @@ td .sub.mono { font-family: "Cascadia Mono", Consolas, monospace; font-size: 11p
 .metrics b { display: block; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .metrics span { font-size: 11.5px; color: var(--faint); }
 .cmdbar { position: sticky; bottom: -32px; margin: 14px -8px -16px; padding: 10px 14px; display: flex; align-items: center; gap: 12px; background: var(--cmdbar); backdrop-filter: blur(10px); border: 1px solid var(--stroke-strong); border-radius: var(--r-lg); box-shadow: 0 -8px 24px rgba(0, 0, 0, .35); }
+
+/* traffic chart */
+.chart { position: relative; height: 180px; margin-top: 14px; }
+.chart svg { display: block; width: 100%; height: 100%; }
+.chart .grid { stroke: var(--stroke); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart .rx-area { fill: color-mix(in srgb, var(--accent) 22%, transparent); }
+.chart .rx-line { fill: none; stroke: var(--accent); stroke-width: 1.6; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.chart .tx-line { fill: none; stroke: var(--udp); stroke-width: 1.6; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.chart .ylab { position: absolute; left: 6px; top: 2px; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.chart .xlab { position: absolute; left: 6px; right: 6px; bottom: -18px; display: flex; justify-content: space-between; font-size: 11px; color: var(--faint); }
+.chart-wrap-pad { padding-bottom: 20px; }
+.dot-live { color: var(--green); }
+
+/* learn timeline */
+.tl-row { display: grid; grid-template-columns: 200px 1fr 92px; align-items: center; gap: 12px; padding: 5px 0; }
+.tl-row .who { min-width: 0; }
+.tl-row .who .mono { font-size: 12px; }
+.tl-row .who .sub { font-size: 11px; color: var(--faint); }
+.tl-track { position: relative; height: 16px; border-radius: 4px; background: var(--card-2); }
+.tl-track i { position: absolute; top: 2px; bottom: 2px; min-width: 3px; border-radius: 3px; background: var(--accent); }
+.tl-track i.udp { background: var(--udp); }
+.tl-row .at { text-align: right; font-size: 11.5px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.tl-axis { display: grid; grid-template-columns: 200px 1fr 92px; gap: 12px; padding-top: 6px; }
+.tl-axis div { display: flex; justify-content: space-between; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; border-top: 1px solid var(--stroke); padding-top: 4px; }
 
 /* theme picker */
 .setting .ctl.swatches { width: auto; gap: 12px; flex-wrap: wrap; }
