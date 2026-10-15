@@ -48,6 +48,9 @@ interface LearnEntry {
   total_bytes: number;
   suggested: boolean;
 }
+interface PathLeg { method: string; last: number | null; avg: number | null; min: number | null; max: number | null; jitter: number | null; lossPct: number; samples: (number | null)[] }
+interface ServerLeg extends PathLeg { ip: string; port: number | null }
+interface PathView { tunnelUp: boolean; endpoint: string | null; a: PathLeg | null; servers: ServerLeg[]; serversSupported: boolean; game: string | null }
 interface HostTraffic { ip: string; proto: string; port: number; rx: number; tx: number; last_age_ms: number }
 interface TrafficView {
   active: boolean;
@@ -107,6 +110,9 @@ const ICONS: Record<string, string> = {
   download: '<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>',
   logout: '<path d="M15 4h4a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-4M10 8l-4 4 4 4M6 12h10"/>',
   login: '<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4M14 8l4 4-4 4M18 12H8"/>',
+  monitor: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
+  server: '<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
   activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
   radar: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><path d="M12 12l6-6"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
@@ -231,6 +237,7 @@ function setView(v: View) {
   if (v === "learn") refreshLearn();
   if (v === "profiles") refreshProfiles();
   if (v === "traffic") void refreshTraffic();
+  if (v === "dashboard") void refreshPath();
 }
 
 // ───────────────────────── rendering ─────────────────────────
@@ -577,6 +584,120 @@ function buildEntries(): ProfileEntry[] {
     }
   }
   return out;
+}
+
+// ───────────────────────── connection path ─────────────────────────
+
+let lastPath: PathView | null = null;
+
+/** good / ok / bad / none from average latency and packet loss. */
+function quality(avg: number | null, loss: number): "good" | "ok" | "bad" | "none" {
+  if (avg === null) return loss >= 100 ? "bad" : "none";
+  if (loss >= 5 || avg >= 110) return "bad";
+  if (loss >= 1 || avg >= 50) return "ok";
+  return "good";
+}
+const fmtMs = (v: number | null) => (v === null ? "—" : v < 10 ? `${v.toFixed(1)} ms` : `${Math.round(v)} ms`);
+const fmtPct = (v: number) => `${v < 10 ? v.toFixed(1) : Math.round(v)}%`;
+
+function spark(samples: (number | null)[]): string {
+  const ok = samples.filter((x): x is number => x !== null);
+  if (samples.length < 2 || !ok.length) return "";
+  const W = 300, H = 30;
+  const max = Math.max(...ok, 1) * 1.15;
+  const x = (i: number) => ((i / (samples.length - 1)) * W).toFixed(1);
+  const y = (v: number) => (H - 3 - (v / max) * (H - 8)).toFixed(1);
+  let d = "";
+  let pen = false;
+  samples.forEach((v, i) => {
+    if (v === null) { pen = false; return; }
+    d += `${pen ? "L" : "M"}${x(i)},${y(v)} `;
+    pen = true;
+  });
+  const lost = samples.map((v, i) => (v === null ? `<line class="lost" x1="${x(i)}" x2="${x(i)}" y1="${H - 9}" y2="${H}"/>` : "")).join("");
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><path class="ln" d="${d}"/>${lost}</svg>`;
+}
+
+function linkHtml(leg: { avg: number | null; last: number | null; lossPct: number; jitter: number | null } | null, opts: { pending?: string } = {}): string {
+  if (!leg) {
+    return `<div class="plink" data-q="none"><div class="line"></div><div class="ms">${esc(opts.pending ?? "—")}</div></div>`;
+  }
+  const q = quality(leg.avg, leg.lossPct);
+  const shown = leg.last ?? leg.avg;
+  return `<div class="plink" data-q="${q}"><div class="line"></div>
+    <div class="ms">${q === "bad" && leg.avg === null ? "no reply" : fmtMs(shown)}</div>
+    <div class="meta">loss <b>${fmtPct(leg.lossPct)}</b>${leg.jitter !== null ? ` · jitter ${leg.jitter < 10 ? leg.jitter.toFixed(1) : Math.round(leg.jitter)} ms` : ""}</div></div>`;
+}
+
+const node = (ic: string, title: string, sub: string, dim = false) =>
+  `<div class="pnode ${dim ? "dim" : ""}">${icon(ic)}<div class="t">${esc(title)}</div><div class="s" title="${esc(sub)}">${esc(sub)}</div></div>`;
+
+const methodLabel = (m: string) => (m === "icmp" ? "ICMP ping" : m === "tcp" ? "TCP connect" : m);
+
+function legCard(title: string, sub: string, l: PathLeg): string {
+  const q = quality(l.avg, l.lossPct);
+  return `<div class="leg" style="--tone:var(${q === "good" ? "--green" : q === "ok" ? "--amber" : q === "bad" ? "--red" : "--accent"})">
+    <div class="t"><span class="grow">${esc(title)}${sub ? ` <span class="faint mono" style="font-weight:400">${esc(sub)}</span>` : ""}</span><span class="chip">${esc(methodLabel(l.method))}</span></div>
+    <div class="nums"><span>avg <b>${fmtMs(l.avg)}</b></span><span>min <b>${fmtMs(l.min)}</b></span><span>max <b>${fmtMs(l.max)}</b></span><span>jitter <b>${fmtMs(l.jitter)}</b></span><span>loss <b>${fmtPct(l.lossPct)}</b></span></div>
+    ${spark(l.samples)}
+  </div>`;
+}
+
+async function refreshPath() {
+  if (view !== "dashboard") return;
+  try {
+    lastPath = await invoke<PathView>("get_path");
+  } catch (e) {
+    console.error(e);
+    return;
+  }
+  renderPath();
+}
+
+function renderPath() {
+  const p = lastPath;
+  const s = S;
+  if (!p || !s) return;
+  const running = s.watched.find((g) => isRunning(s, g));
+  const host = (p.endpoint ?? "").replace(/:\d+$/, "");
+  const servers = p.servers;
+  const rows = Math.max(1, servers.length);
+
+  // left half (PC -> GPN server) spans every server row
+  const span = `style="grid-row: 1 / span ${rows}"`;
+  let html = `<div class="path-grid">
+    <div ${span}>${node("monitor", "This PC", running ? gameName(s, running) : "no game running")}</div>
+    <div ${span}>${p.endpoint === null ? linkHtml(null, { pending: "—" }) : linkHtml(p.a, { pending: "measuring…" })}</div>
+    <div ${span}>${node("server", "GPN server", host || "not connected yet", p.endpoint === null)}</div>`;
+
+  if (!servers.length) {
+    const why = !p.tunnelUp ? "tunnel down" : !running ? "no game running" : !p.serversSupported ? "update server" : "measuring…";
+    html += `<div>${linkHtml(null, { pending: why })}</div><div>${node("globe", "Game server", running ? "waiting for traffic" : "—", true)}</div>`;
+  } else {
+    servers.forEach((sv, i) => {
+      // later rows must start at the 4th column explicitly: the spanned cells above occupy columns 1-3
+      html += `<div style="grid-column: 4; grid-row: ${i + 1}">${linkHtml(sv)}</div>
+        <div style="grid-column: 5; grid-row: ${i + 1}">${node("globe", i === 0 ? "Game server" : `Game server ${i + 1}`, `${sv.ip}${sv.port ? ":" + sv.port : ""}`)}</div>`;
+    });
+  }
+  html += "</div>";
+  $("pathDiagram").innerHTML = html;
+
+  // totals + status line
+  const a = p.a?.avg ?? null;
+  const b = servers[0]?.avg ?? null;
+  const parts: string[] = [];
+  if (a !== null && b !== null) parts.push(`<span class="total"><b>≈ ${fmtMs(a + b)}</b> from you to the game server via GPN</span> <span class="faint">(${fmtMs(a)} + ${fmtMs(b)})</span>`);
+  else if (p.endpoint === null) parts.push("Latency appears after the first connection to your GPN server.");
+  else if (!p.serversSupported) parts.push("The server doesn't support latency probes yet — update the GPN server to see the GPN → game leg.");
+  else if (a !== null) parts.push(`You → GPN server is measured${running ? "; the GPN → game leg appears once the game connects through the tunnel" : ". Launch a game to measure the rest"}.`);
+  $("pathFoot").innerHTML = parts.join(" ");
+  $("pathInfo").textContent = servers.length > 1 ? `${servers.length} game servers` : "";
+
+  const cards: string[] = [];
+  if (p.a) cards.push(legCard("You → GPN server", host, p.a));
+  servers.forEach((sv) => cards.push(legCard("GPN → game server", `${sv.ip}${sv.port ? ":" + sv.port : ""}`, sv)));
+  $("pathLegs").innerHTML = cards.join("");
 }
 
 // ───────────────────────── traffic monitor ─────────────────────────
@@ -1169,6 +1290,7 @@ async function boot() {
   setInterval(refresh, 3000);
   setInterval(refreshLearn, 3000);
   setInterval(() => void refreshTraffic(), 1000);
+  setInterval(() => void refreshPath(), 2000);
 }
 
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => void boot());

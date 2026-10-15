@@ -314,6 +314,37 @@ td .sub.mono { font-family: "Cascadia Mono", Consolas, monospace; font-size: 11p
 .metrics span { font-size: 11.5px; color: var(--faint); }
 .cmdbar { position: sticky; bottom: -32px; margin: 14px -8px -16px; padding: 10px 14px; display: flex; align-items: center; gap: 12px; background: var(--cmdbar); backdrop-filter: blur(10px); border: 1px solid var(--stroke-strong); border-radius: var(--r-lg); box-shadow: 0 -8px 24px rgba(0, 0, 0, .35); }
 
+/* connection path: PC -> GPN server -> game server */
+.path-grid { display: grid; grid-template-columns: 148px minmax(110px, 1fr) 148px minmax(110px, 1fr) 190px; align-items: center; row-gap: 14px; }
+.pnode { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; min-height: 86px; padding: 10px; text-align: center; border-radius: 10px; border: 1px solid var(--stroke-strong); background: var(--card-2); min-width: 0; }
+.pnode svg.i { width: 24px; height: 24px; color: var(--accent); }
+.pnode .t { font-weight: 600; }
+.pnode .s { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--faint); font-family: "Cascadia Mono", Consolas, monospace; }
+.pnode.dim { opacity: .45; }
+.pnode.dim svg.i { color: var(--faint); }
+.plink { --tone: var(--faint); position: relative; height: 62px; display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 0; }
+.plink[data-q="good"] { --tone: var(--green); }
+.plink[data-q="ok"] { --tone: var(--amber); }
+.plink[data-q="bad"] { --tone: var(--red); }
+.plink .line { position: absolute; left: 4px; right: 4px; top: 26px; height: 2px; border-radius: 2px; background: color-mix(in srgb, var(--tone) 45%, transparent); }
+.plink[data-q="good"] .line::after, .plink[data-q="ok"] .line::after, .plink[data-q="bad"] .line::after { content: ""; position: absolute; top: -2px; left: 0; width: 6px; height: 6px; border-radius: 50%; background: var(--tone); animation: travel 1.6s linear infinite; }
+.plink[data-q="bad"] .line::after { animation-duration: 3s; }
+.plink .ms { position: relative; z-index: 1; margin-top: -8px; padding: 1px 9px; border-radius: 99px; border: 1px solid color-mix(in srgb, var(--tone) 50%, var(--stroke)); background: var(--card); color: var(--tone); font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.plink .meta { position: absolute; bottom: 0; font-size: 11px; color: var(--dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.plink .meta b { color: var(--tone); font-weight: 600; }
+.path-foot { margin-top: 14px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--dim); font-size: 12.5px; }
+.path-foot .total { font-size: 13px; color: var(--text); }
+.legs { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; margin-top: 14px; }
+.leg { padding: 10px 12px; border: 1px solid var(--stroke); border-radius: 8px; background: var(--card-2); min-width: 0; }
+.leg .t { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 6px; }
+.leg .t .grow { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.leg .nums { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.leg .nums b { color: var(--text); font-weight: 600; }
+.leg svg.spark { display: block; width: 100%; height: 30px; margin-top: 8px; }
+.spark .ln { fill: none; stroke: var(--tone, var(--accent)); stroke-width: 1.5; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.spark .lost { stroke: var(--red); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+@keyframes travel { from { left: 0; } to { left: calc(100% - 6px); } }
+
 /* traffic chart */
 .chart { position: relative; height: 180px; margin-top: 14px; }
 .chart svg { display: block; width: 100%; height: 100%; }
@@ -394,6 +425,8 @@ details.server[open] summary { margin-bottom: 6px; }
 
 /* compact window: icon rail */
 @media (max-width: 880px) {
+  .path-grid { grid-template-columns: 1fr; }
+  .plink { height: 48px; }
   .body { grid-template-columns: 52px 1fr; }
   .nav-item { justify-content: center; padding: 0; } .nav-item .label, .nav-item .kbd, .nav-item .pip:not(.rec), .account .who { display: none; }
   .nav-item .pip.rec { position: absolute; top: 8px; right: 10px; margin: 0; }

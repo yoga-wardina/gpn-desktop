@@ -2,6 +2,7 @@ mod api;
 mod asn;
 mod config;
 mod etw;
+mod latency;
 mod learn;
 mod meta_windows;
 mod monitor;
@@ -26,6 +27,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use config::{ConfigStore, GameMeta, MetaCache};
 use etw::{EtwHandle, EtwStatus, FlowEvent, PidMap, Proto};
+use latency::{PathMonitor, PathView, ServerLeg};
 use learn::{Learn, LearnView};
 use monitor::{Monitor, TrafficView};
 use routing::{desired_routes, Desired, Router};
@@ -58,6 +60,8 @@ struct AppState {
     learn: Learn,
     /// per-game bandwidth + server breakdown (always on, independent of learn mode)
     monitor: Monitor,
+    /// latency + loss: PC -> GPN server, and GPN server -> game servers
+    path: PathMonitor,
     profiles: ProfileStore,
     etw: Mutex<EtwSlot>,
     etw_tx: UnboundedSender<FlowEvent>,
@@ -167,6 +171,13 @@ async fn auth_logout(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 fn get_traffic(state: State<'_, AppState>, game: String, window_secs: Option<usize>) -> TrafficView {
     state.monitor.snapshot(&game_key(&game), window_secs.unwrap_or(120))
+}
+
+/// Latency / jitter / loss of the route PC -> GPN server -> game servers.
+#[tauri::command]
+fn get_path(state: State<'_, AppState>) -> PathView {
+    let t = state.tunnel.view();
+    state.path.view(t.tunnel_up, t.endpoint)
 }
 
 #[tauri::command]
@@ -367,6 +378,113 @@ async fn maintenance_loop(app: AppHandle) {
     }
 }
 
+async fn resolve_v4(host: &str) -> Option<Ipv4Addr> {
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return Some(ip);
+    }
+    tokio::net::lookup_host((host, 0)).await.ok()?.find_map(|a| match a.ip() {
+        std::net::IpAddr::V4(v) => Some(v),
+        _ => None,
+    })
+}
+
+/// Leg A — this PC -> the GPN server: one probe a second while a game runs (every 3 s otherwise),
+/// as soon as the server's address is known (after the first registration).
+async fn path_a_loop(app: AppHandle) {
+    let mut resolved: Option<(String, Ipv4Addr)> = None;
+    loop {
+        let (endpoint, busy) = {
+            let s = app.state::<AppState>();
+            let endpoint = s.tunnel.view().endpoint;
+            let busy = !s.pids.read().unwrap().is_empty();
+            (endpoint, busy)
+        };
+        match endpoint {
+            None => {
+                app.state::<AppState>().path.clear_a();
+                resolved = None;
+            }
+            Some(ep) => {
+                if resolved.as_ref().map(|(e, _)| e != &ep).unwrap_or(true) {
+                    let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(&ep).to_string();
+                    resolved = resolve_v4(&host).await.map(|ip| (ep.clone(), ip));
+                }
+                if let Some((_, ip)) = &resolved {
+                    let state = app.state::<AppState>();
+                    let method = state.path.next_method();
+                    let rtt = latency::probe_a(method, *ip).await;
+                    state.path.push_a(method, rtt);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(if busy { 1000 } else { 3000 })).await;
+    }
+}
+
+/// Leg B — GPN server -> the game's servers, measured by the server. We tell it which of our routed
+/// game servers to watch (top traffic first) and read the results back every few seconds.
+async fn path_b_loop(app: AppHandle) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let state = app.state::<AppState>();
+        let t = state.tunnel.view();
+        let game = state.pids.read().unwrap().values().next().cloned();
+        let Some(game) = game.filter(|_| t.tunnel_up) else {
+            state.path.set_servers(None, Vec::new(), false);
+            continue;
+        };
+
+        // TCP ports can be probed by connecting; for UDP hosts the server falls back to ICMP
+        let port_for = |proto: &str, port: Option<u16>| if proto == "tcp" { port } else { None };
+        let mut cands: Vec<(String, Option<u16>)> = state
+            .monitor
+            .snapshot(&game, 10)
+            .hosts
+            .into_iter()
+            .map(|h| (h.ip.clone(), port_for(&h.proto, Some(h.port))))
+            .collect();
+        cands.extend(state.targets.lock().unwrap().iter().map(|x| (x.ip.clone(), port_for(&x.proto, x.port))));
+        let picks = latency::pick_targets(&cands, &t.allowed_ips, 3);
+        if picks.is_empty() {
+            state.path.set_servers(Some(game), Vec::new(), false);
+            continue;
+        }
+
+        let body = serde_json::json!({
+            "targets": picks.iter().map(|(ip, port)| serde_json::json!({ "ip": ip, "port": port })).collect::<Vec<_>>()
+        });
+        let api = state.api.clone();
+        let declared = match api.request(reqwest::Method::POST, "/api/probe", Some(body)).await {
+            Ok(res) if res.status().is_success() => true,
+            Ok(res) => {
+                // an old server answers 404 "not found" for the whole route; "unknown peer" is a different 404
+                let unsupported = res.status() == reqwest::StatusCode::NOT_FOUND
+                    && res.text().await.map(|b| b.contains("\"not found\"")).unwrap_or(false);
+                if unsupported {
+                    state.path.set_servers(Some(game.clone()), Vec::new(), true);
+                }
+                false
+            }
+            Err(_) => false,
+        };
+        if !declared {
+            continue;
+        }
+        if let Ok(res) = api.request(reqwest::Method::GET, "/api/probe", None).await {
+            if res.status().is_success() {
+                if let Ok(v) = res.json::<serde_json::Value>().await {
+                    let results: Vec<ServerLeg> = v
+                        .get("results")
+                        .cloned()
+                        .and_then(|r| serde_json::from_value(r).ok())
+                        .unwrap_or_default();
+                    state.path.set_servers(Some(game), results, false);
+                }
+            }
+        }
+    }
+}
+
 /// Background loop: poll processes + connections, emit state, push to VPS.
 /// Body wrapped in catch_unwind so any panic (e.g. from OS command parsing)
 /// logs and retries instead of killing the app.
@@ -528,6 +646,7 @@ pub fn run() {
                 running_games: Mutex::new(HashSet::new()),
                 learn,
                 monitor: Monitor::default(),
+                path: PathMonitor::default(),
                 profiles: ProfileStore::new(&data_dir),
                 etw: Mutex::new(EtwSlot { status: EtwStatus::off(), handle: None }),
                 etw_tx: flow_tx,
@@ -547,6 +666,8 @@ pub fn run() {
             tauri::async_runtime::spawn(asn_worker(handle.clone(), asn_rx));
             tauri::async_runtime::spawn(maintenance_loop(handle.clone()));
             tauri::async_runtime::spawn(watcher_loop(handle.clone()));
+            tauri::async_runtime::spawn(path_a_loop(handle.clone()));
+            tauri::async_runtime::spawn(path_b_loop(handle.clone()));
             {
                 let t = tunnel.clone();
                 tauri::async_runtime::spawn(async move {
@@ -570,6 +691,7 @@ pub fn run() {
             auth_logout,
             get_learn,
             get_traffic,
+            get_path,
             reset_traffic,
             set_learning,
             clear_learn,

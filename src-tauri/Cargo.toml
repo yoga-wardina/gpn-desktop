@@ -40,3 +40,4 @@ strip = true
 
 [target."cfg(windows)".dependencies]
 ferrisetw = "1.2.0"
+windows-sys = { version = "0.60", features = ["Win32_NetworkManagement_IpHelper", "Win32_Foundation", "Win32_Networking_WinSock"] }

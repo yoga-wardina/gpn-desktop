@@ -151,6 +151,22 @@ w.__TAURI_INTERNALS__ = {
         return { active: true, started_ms: Date.now() - 26 * 60_000, total_rx: 110_300_000, total_tx: 15_000_000, peak_rx: 310_000, peak_tx: 44_000,
           rx_per_sec: sum(rx.slice(-3)) / 3, tx_per_sec: sum(tx.slice(-3)) / 3, series_rx: rx, series_tx: tx, hosts };
       }
+      case "get_path": {
+        const live = state.procs.length > 0;
+        const wobble = (base: number, amp: number, loss: number) => Array.from({ length: 60 }, (_, i) => (Math.random() * 100 < loss ? null : Math.round((base + amp * Math.sin(i / 4) + (Math.random() - 0.5) * amp) * 10) / 10));
+        const stats = (samples: (number | null)[], method: string) => {
+          const ok = samples.filter((x): x is number => x !== null);
+          const avg = ok.reduce((a, b) => a + b, 0) / (ok.length || 1);
+          const jit = ok.slice(1).reduce((a, v, i) => a + Math.abs(v - ok[i]), 0) / Math.max(1, ok.length - 1);
+          return { method, last: samples[samples.length - 1], avg: Math.round(avg * 10) / 10, min: Math.min(...ok), max: Math.max(...ok), jitter: Math.round(jit * 10) / 10, lossPct: Math.round((samples.length - ok.length) / samples.length * 1000) / 10, samples };
+        };
+        if (scene === "empty" || scene === "signedout") return { tunnelUp: false, endpoint: null, a: null, servers: [], serversSupported: true, game: null };
+        const a = stats(wobble(23, 5, 1), "icmp");
+        const servers = live && state.tunnel.tunnelUp
+          ? [{ ip: "203.0.113.50", port: 13328, ...stats(wobble(41, 7, 0), "tcp") }, { ip: "203.0.113.77", port: 13328, ...stats(wobble(96, 38, 7), "tcp") }]
+          : [];
+        return { tunnelUp: state.tunnel.tunnelUp, endpoint: "198.51.100.10:51820", a, servers, serversSupported: true, game: live ? "aion2.exe" : null };
+      }
       case "reset_traffic": return null;
       case "set_learning": state.learning = !!args.enabled; return null;
       case "clear_learn": delete learnData[keyOf(args.game)]; return null;

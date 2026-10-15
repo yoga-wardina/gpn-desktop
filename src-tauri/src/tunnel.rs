@@ -40,6 +40,8 @@ pub struct TunnelView {
     pub allowed_ips: Vec<String>,
     /// seconds since the last WireGuard handshake (None = never / tunnel down)
     pub handshake_age_secs: Option<u64>,
+    /// the GPN server's public WireGuard endpoint (host:port) once registered
+    pub endpoint: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -118,6 +120,7 @@ impl TunnelManager {
         v.vpn_ip = i.vpn_ip.clone();
         v.tunnel_up = i.up;
         v.allowed_ips = i.allowed.clone();
+        v.endpoint = i.endpoint.clone();
         if !i.up {
             v.handshake_age_secs = None;
         }
