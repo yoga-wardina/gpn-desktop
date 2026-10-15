@@ -17,16 +17,34 @@ pub fn resolve(exe_path: &str) -> Option<ExeMeta> {
     let script = r#"$ErrorActionPreference='Stop'
 $f = Get-Item -LiteralPath $env:GPN_EXE
 $v = $f.VersionInfo
+Add-Type -AssemblyName System.Drawing
+Add-Type -Namespace Gpn -Name Icons -MemberDefinition '[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern uint PrivateExtractIcons(string file, int index, int cx, int cy, IntPtr[] icons, uint[] ids, uint count, uint flags); [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);'
+$bmp = $null
+# ask the exe's own icon resource for a large image (ExtractAssociatedIcon only gives 32px)
+foreach ($size in 256, 128, 64) {
+  try {
+    $h = New-Object IntPtr[] 1
+    $id = New-Object uint32[] 1
+    $n = [Gpn.Icons]::PrivateExtractIcons($f.FullName, 0, $size, $size, $h, $id, 1, 0)
+    if ($n -gt 0 -and $h[0] -ne [IntPtr]::Zero) {
+      $bmp = [System.Drawing.Icon]::FromHandle($h[0]).ToBitmap()
+      [Gpn.Icons]::DestroyIcon($h[0]) | Out-Null
+      break
+    }
+  } catch {}
+}
+if (-not $bmp) { try { $bmp = [System.Drawing.Icon]::ExtractAssociatedIcon($f.FullName).ToBitmap() } catch {} }
 $i = $null
-try {
-  Add-Type -AssemblyName System.Drawing
-  $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($f.FullName)
-  if ($ico) {
-    $ms = New-Object System.IO.MemoryStream
-    $ico.ToBitmap().Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-    $i = [Convert]::ToBase64String($ms.ToArray())
-  }
-} catch {}
+if ($bmp) {
+  # 96px = crisp at 48 CSS px on a 200% display, ~15 KB as PNG
+  $out = New-Object System.Drawing.Bitmap 96, 96
+  $g = [System.Drawing.Graphics]::FromImage($out)
+  $g.InterpolationMode = 'HighQualityBicubic'; $g.SmoothingMode = 'HighQuality'; $g.PixelOffsetMode = 'HighQuality'
+  $g.DrawImage($bmp, 0, 0, 96, 96); $g.Dispose()
+  $ms = New-Object System.IO.MemoryStream
+  $out.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+  $i = [Convert]::ToBase64String($ms.ToArray())
+}
 @{ name = @($v.FileDescription, $v.ProductName) | Where-Object { $_ } | Select-Object -First 1; company = $v.CompanyName; icon = $i } | ConvertTo-Json -Compress"#;
 
     let out = crate::proc::command("powershell")

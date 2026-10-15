@@ -96,6 +96,9 @@ pub struct GameMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     pub source: String,
+    /// metadata format version; entries older than the app's current one are re-resolved
+    #[serde(default)]
+    pub v: u32,
 }
 
 pub struct MetaCache {

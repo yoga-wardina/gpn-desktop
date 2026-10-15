@@ -239,44 +239,57 @@ fn start_etw(state: &AppState) {
     }
 }
 
+/// Bump when the icon extraction changes so cached entries get refreshed.
+const META_VERSION: u32 = 2;
+
 async fn resolve_meta_inner(app: &AppHandle, exe: &str) {
     let key = meta_key(exe);
     let state = app.state::<AppState>();
-    if state.meta.get(&key).is_some() {
-        return;
+    let has_path = exe.contains('\\') || exe.contains('/');
+    let cached = state.meta.get(&key);
+    // up to date, and either complete or impossible to improve from a bare file name
+    if let Some(m) = &cached {
+        if m.v >= META_VERSION && (m.icon.is_some() || !has_path) {
+            return;
+        }
     }
     let file_name = std::path::Path::new(exe)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| exe.to_string());
     let name_only = GameMeta {
-        name: file_name
-            .trim_end_matches(".exe")
-            .trim_end_matches(".EXE")
-            .to_string(),
+        name: file_name.trim_end_matches(".exe").trim_end_matches(".EXE").to_string(),
         company: None,
         icon: None,
         source: "filename".into(),
+        v: META_VERSION,
     };
 
-    let resolved = meta_windows::resolve(exe).map(|m| {
-        let name_src = m.name.clone();
-        GameMeta {
-            name: m.name.unwrap_or_else(|| name_only.name.clone()),
-            company: m.company,
-            icon: m
-                .icon_b64
-                .filter(|b| meta_windows::valid_png_b64(b))
-                .map(|b| format!("data:image/png;base64,{b}")),
-            source: if name_src.is_some() {
-                "versioninfo"
-            } else {
-                "filename"
+    // PowerShell is slow (~1s): keep it off the async runtime threads
+    let path = exe.to_string();
+    let found = tauri::async_runtime::spawn_blocking(move || meta_windows::resolve(&path))
+        .await
+        .ok()
+        .flatten();
+    let mut resolved = found
+        .map(|m| {
+            let name_src = m.name.clone();
+            GameMeta {
+                name: m.name.unwrap_or_else(|| name_only.name.clone()),
+                company: m.company,
+                icon: m
+                    .icon_b64
+                    .filter(|b| meta_windows::valid_png_b64(b))
+                    .map(|b| format!("data:image/png;base64,{b}")),
+                source: if name_src.is_some() { "versioninfo" } else { "filename" }.into(),
+                v: META_VERSION,
             }
-            .into(),
-        }
-    }).unwrap_or(name_only);
-
+        })
+        .unwrap_or(name_only);
+    // never lose a good icon just because this lookup couldn't produce one
+    if resolved.icon.is_none() {
+        resolved.icon = cached.and_then(|m| m.icon);
+    }
     state.meta.insert(key, resolved);
 }
 
@@ -462,6 +475,10 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_window_state::Builder::default()
+            .with_state_flags(tauri_plugin_window_state::StateFlags::POSITION)
+            .build())
         .setup(|app| {
             let handle = app.handle().clone();
             let data_dir = app.path().app_data_dir()?;
@@ -498,6 +515,15 @@ pub fn run() {
                 etw_tx: flow_tx,
             });
 
+            {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let games = h.state::<AppState>().cfg.config.lock().unwrap().games.clone();
+                    for g in games {
+                        resolve_meta_inner(&h, &g).await;
+                    }
+                });
+            }
             start_etw(&handle.state::<AppState>());
             tauri::async_runtime::spawn(flow_consumer(handle.clone(), flow_rx));
             tauri::async_runtime::spawn(asn_worker(handle.clone(), asn_rx));

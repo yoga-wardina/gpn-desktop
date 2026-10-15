@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="64" y1="40" x2="448" y2="472" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff6a5c"/>
+      <stop offset="1" stop-color="#c40f2b"/>
+    </linearGradient>
+    <radialGradient id="shine" cx="0.28" cy="0.12" r="0.9">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.34"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#ffe1e1"/>
+    </linearGradient>
+  </defs>
+  <!-- tile -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#shine)"/>
+  <!-- "G" drawn as a tunnel: one continuous path with a node at each end -->
+  <g fill="none" stroke="url(#ink)" stroke-width="48" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M341 155 A132 132 0 1 0 388 256 L294 256"/>
+  </g>
+  <!-- end nodes: white discs with a hole in the tile colour -->
+  <g>
+    <circle cx="341" cy="155" r="35" fill="#ffffff"/>
+    <circle cx="341" cy="155" r="14" fill="#e0283b"/>
+    <circle cx="294" cy="256" r="35" fill="#ffffff"/>
+    <circle cx="294" cy="256" r="14" fill="#e0283b"/>
+  </g>
+</svg>
