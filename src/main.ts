@@ -70,7 +70,7 @@ interface ProfileEntry {
   cidr: string;
   proto: string;
   ports: number[];
-  source: "observed" | "prefix";
+  source: "observed" | "prefix" | "pack";
   asn: number | null;
   as_name: string | null;
   note: string;
@@ -220,6 +220,9 @@ const selKey = (e: LearnEntry) => `${selectedGame}|${e.proto}|${e.ip}`;
 const portList = (e: LearnEntry) => Object.keys(e.ports).map(Number).sort((a, b) => a - b);
 
 const profileFor = (exe: string) => profiles.find((p) => p.game === gameKey(exe));
+/** Entries a person reviewed vs. bundled range packs (e.g. a whole cloud region). */
+const reviewedEntries = (p: Profile) => p.entries.filter((e) => e.source !== "pack");
+const packEntries = (p: Profile) => p.entries.filter((e) => e.source === "pack");
 const isRunning = (s: State, exe: string) => s.procs.some((p) => (p.game ?? p.name.toLowerCase()) === gameKey(exe));
 const gameName = (s: State, exe: string) => s.meta?.[exe]?.name ?? gameKey(exe).replace(/\.exe$/, "");
 
@@ -348,7 +351,7 @@ function gameCard(s: State, exe: string, actions: boolean): string {
   const iconHtml = m?.icon ? `<img class="gicon" src="${m.icon}" alt="" draggable="false">` : `<div class="gicon fallback">${esc(name.charAt(0).toUpperCase())}</div>`;
   const chips = [
     running ? '<span class="chip dot ok live">Running</span>' : '<span class="chip">Not running</span>',
-    prof ? `<span class="chip tcp">Profile · ${plural(prof.entries.length, "server")}</span>` : '<span class="chip">No profile</span>',
+    prof ? `<span class="chip tcp">Profile · ${plural(reviewedEntries(prof).length, "server")}${packEntries(prof).length ? " + ranges" : ""}</span>` : '<span class="chip">No profile</span>',
     m?.company ? `<span class="chip">${esc(m.company)}</span>` : "",
   ].join("");
   const buttons = actions
@@ -840,17 +843,21 @@ function renderProfiles() {
   }
   list.innerHTML = profiles
     .map((p) => {
-      const shown = p.entries.slice(0, 14);
+      const reviewed = reviewedEntries(p);
+      const packs = packEntries(p);
+      const shown = reviewed.slice(0, 14);
+      const packName = packs[0]?.as_name ?? "Range pack";
       return `<div class="card profile">
         <div class="head">
           <div class="grow"><div style="font-weight:600;font-size:14px">${esc(p.name)}</div>
-            <div class="dim small">${esc(p.game)} · ${plural(p.entries.length, "entry", "entries")} · updated ${esc(new Date(p.updated).toLocaleDateString())}</div></div>
+            <div class="dim small">${esc(p.game)} · ${plural(reviewed.length, "server")}${packs.length ? ` + ${plural(packs.length, "range")}` : ""} · updated ${esc(new Date(p.updated).toLocaleDateString())}</div></div>
           <button class="btn sm" data-export="${esc(p.game)}">${icon("download")}Export</button>
           <button class="btn sm icon subtle danger-text" data-remove-profile="${esc(p.game)}" title="Delete" aria-label="Delete profile">${icon("trash")}</button>
         </div>
         <div class="cidrs">${shown
           .map((e) => `<span class="cidr">${esc(e.cidr)}<i>${esc(e.proto)}${e.ports.length ? ":" + e.ports.join(",") : ""}</i></span>`)
-          .join("")}${p.entries.length > shown.length ? `<span class="cidr"><i>+${p.entries.length - shown.length} more</i></span>` : ""}</div>
+          .join("")}${reviewed.length > shown.length ? `<span class="cidr"><i>+${reviewed.length - shown.length} more</i></span>` : ""}</div>
+        ${packs.length ? `<div class="row" style="margin-top:10px"><span class="chip warn">${esc(packName)} · ${plural(packs.length, "range")}</span><span class="dim small grow" title="${esc(packs[0]?.note ?? "")}">pre-routed whenever the game runs</span><button class="btn sm subtle danger-text" data-remove-pack="${esc(p.game)}">Remove</button></div>` : ""}
       </div>`;
     })
     .join("");
@@ -1089,7 +1096,7 @@ async function windowChrome() {
 function wire() {
   // delegated clicks
   document.addEventListener("click", async (ev) => {
-    const t = (ev.target as HTMLElement).closest<HTMLElement>("[data-nav],[data-go],[data-act],[data-learn],[data-remove-game],[data-remove-profile],[data-export],[data-theme-pick]");
+    const t = (ev.target as HTMLElement).closest<HTMLElement>("[data-nav],[data-go],[data-act],[data-learn],[data-remove-game],[data-remove-profile],[data-remove-pack],[data-export],[data-theme-pick]");
     if (!t) return;
     if (t.dataset.themePick) setThemePref(t.dataset.themePick as ThemePref);
     else if (t.dataset.nav) setView(t.dataset.nav as View);
@@ -1106,6 +1113,15 @@ function wire() {
         await invoke("unwatch_game", { exe });
         toast(`Removed ${name}`);
         refresh();
+      }
+    } else if (t.dataset.removePack) {
+      const game = t.dataset.removePack;
+      const p = profiles.find((x) => x.game === game);
+      const name = (p && packEntries(p)[0]?.as_name) || "the range pack";
+      if (await confirmDialog({ title: `Remove ${name}?`, body: "Servers outside your reviewed list are then only routed once the game connects to them, which can cause a reconnect when the game moves you to a new server.", ok: "Remove", danger: true })) {
+        await invoke("remove_pack", { game });
+        toast("Range pack removed");
+        refreshProfiles();
       }
     } else if (t.dataset.removeProfile) {
       const game = t.dataset.removeProfile;

@@ -97,6 +97,7 @@ let profiles: any[] = scene === "empty" ? [] : [
   { version: 1, game: "aion2.exe", name: "AION 2", updated: Date.now() - 24 * 60_000, entries: [
     { cidr: "203.0.113.50/32", proto: "tcp", ports: [], source: "observed", asn: 64500, as_name: "NCSOFT", note: "" },
     { cidr: "198.51.100.0/22", proto: "tcp", ports: [], source: "prefix", asn: 64500, as_name: "NCSOFT", note: "" },
+    ...Array.from({ length: 337 }, (_, i) => ({ cidr: `20.${i % 250}.0.0/17`, proto: "tcp", ports: [], source: "pack", asn: 8075, as_name: "Azure Japan East", note: "AzureCloud.japaneast, Microsoft service tags 2026-10-12" })),
   ] },
   { version: 1, game: "valorant.exe", name: "VALORANT", updated: Date.now() - 86_400_000 * 3, entries: [
     { cidr: "162.249.72.0/24", proto: "udp", ports: [], source: "prefix", asn: 6507, as_name: "RIOT", note: "" },
@@ -176,6 +177,7 @@ w.__TAURI_INTERNALS__ = {
         return p;
       }
       case "get_profiles": return structuredClone(profiles);
+      case "remove_pack": { const p = profiles.find((x) => x.game === args.game); if (!p) return 0; const n = p.entries.filter((e: any) => e.source === "pack").length; p.entries = p.entries.filter((e: any) => e.source !== "pack"); return n; }
       case "delete_profile": profiles = profiles.filter((p) => p.game !== args.game); return null;
       case "export_profile": return `C:\\Users\\you\\AppData\\Roaming\\com.gpn.client\\profiles\\${args.game}.json`;
       case "etw_restart": state.etw = { state: "running", message: "capturing per-process network flows" }; return state.etw;

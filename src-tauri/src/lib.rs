@@ -30,7 +30,7 @@ use etw::{EtwHandle, EtwStatus, FlowEvent, PidMap, Proto};
 use latency::{PathMonitor, PathView, ServerLeg};
 use learn::{Learn, LearnView};
 use monitor::{Monitor, TrafficView};
-use routing::{desired_routes, Desired, Router};
+use routing::{desired_routes, Desired, Router, Sticky};
 use tunnel::TunnelManager;
 use profiles::{Profile, ProfileEntry, ProfileStore};
 use watcher::{game_key, GameProc, Target};
@@ -50,6 +50,8 @@ struct AppState {
     api: Arc<api::GpnApi>,
     tunnel: Arc<TunnelManager>,
     router: Arc<Router>,
+    /// live hosts that stay routed after their connection closes (see routing::Sticky)
+    sticky: Mutex<Sticky>,
     targets: Mutex<Vec<Target>>,
     procs: Mutex<Vec<GameProc>>,
     /// pid -> game key for the running watched games (read by the ETW callback)
@@ -213,6 +215,12 @@ fn save_profile(state: State<'_, AppState>, game: String, name: Option<String>, 
 #[tauri::command]
 fn get_profiles(state: State<'_, AppState>) -> Vec<Profile> {
     state.profiles.list()
+}
+
+/// Drop the bundled range pack(s) (e.g. a cloud region) from a game's profile.
+#[tauri::command]
+fn remove_pack(state: State<'_, AppState>, game: String) -> usize {
+    state.profiles.remove_pack(&game_key(&game))
 }
 
 #[tauri::command]
@@ -565,7 +573,8 @@ async fn watcher_tick(app: AppHandle) {
     // pre-route saved profiles of running games + live hosts; the router applies it
     {
         let running: HashSet<String> = state.procs.lock().unwrap().iter().map(|p| p.game.clone()).collect();
-        let live: Vec<Ipv4Addr> = targets.iter().filter_map(|t| t.ip.parse().ok()).collect();
+        let live_now: Vec<Ipv4Addr> = targets.iter().filter_map(|t| t.ip.parse().ok()).collect();
+        let live = state.sticky.lock().unwrap().update(&live_now, !running.is_empty());
         state.router.update(desired_routes(&state.profiles.list(), &running, &live));
     }
 }
@@ -639,6 +648,7 @@ pub fn run() {
                 api,
                 tunnel: tunnel.clone(),
                 router: router.clone(),
+                sticky: Mutex::new(Sticky::default()),
                 targets: Mutex::new(Vec::new()),
                 procs: Mutex::new(Vec::new()),
                 pids: Arc::new(RwLock::new(HashMap::new())),
@@ -698,6 +708,7 @@ pub fn run() {
             save_profile,
             get_profiles,
             delete_profile,
+            remove_pack,
             export_profile,
             etw_restart,
             relaunch_as_admin

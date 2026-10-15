@@ -21,7 +21,8 @@ pub struct ProfileEntry {
     /// empty = all ports
     #[serde(default)]
     pub ports: Vec<u16>,
-    /// "observed" (a single learned host) | "prefix" (its whole announced prefix)
+    /// "observed" (a single learned host) | "prefix" (its whole announced prefix) |
+    /// "pack" (a bundled range list, e.g. a cloud region; survives re-saving the reviewed servers)
     pub source: String,
     #[serde(default)]
     pub asn: Option<u32>,
@@ -101,9 +102,18 @@ impl ProfileStore {
     }
 
     pub fn save(&self, game: &str, name: &str, entries: Vec<ProfileEntry>) -> Result<Profile, String> {
-        let entries = sanitize(entries)?;
+        // a pack is not part of the learn-mode selection: drop any from the input, carry the old ones over
+        let entries = sanitize(entries.into_iter().filter(|e| e.source != "pack").collect())?;
         if entries.is_empty() {
             return Err("select at least one server".into());
+        }
+        let mut m = self.map.lock().unwrap();
+        let mut entries = entries;
+        if let Some(old) = m.get(game) {
+            entries.extend(old.entries.iter().filter(|e| e.source == "pack").cloned());
+        }
+        if entries.len() > MAX_ENTRIES {
+            return Err(format!("too many entries (max {MAX_ENTRIES})"));
         }
         let profile = Profile {
             version: 1,
@@ -115,10 +125,23 @@ impl ProfileStore {
                 .as_millis() as u64,
             entries,
         };
-        let mut m = self.map.lock().unwrap();
         m.insert(game.to_string(), profile.clone());
         self.persist(&m);
         Ok(profile)
+    }
+
+    /// Remove the range pack(s) from a game's profile; returns how many entries went away.
+    pub fn remove_pack(&self, game: &str) -> usize {
+        let mut m = self.map.lock().unwrap();
+        let Some(p) = m.get_mut(game) else { return 0 };
+        let before = p.entries.len();
+        p.entries.retain(|e| e.source != "pack");
+        let removed = before - p.entries.len();
+        if p.entries.is_empty() {
+            m.remove(game);
+        }
+        self.persist(&m);
+        removed
     }
 
     pub fn delete(&self, game: &str) {
@@ -156,6 +179,27 @@ mod tests {
         assert_eq!(ok.len(), 2);
         assert_eq!(ok[0].ports, vec![7000, 7777]);
         assert_eq!(ok[1].cidr, "52.1.0.0/20");
+    }
+
+    #[test]
+    fn resaving_keeps_the_pack_and_remove_pack_drops_it() {
+        let dir = std::env::temp_dir().join(format!("gpn-profiles-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ProfileStore::new(&dir);
+        let mut pack = entry("52.1.0.0/16");
+        pack.source = "pack".into();
+        // seed a profile that has a pack (as a data file would)
+        {
+            let mut m = store.map.lock().unwrap();
+            m.insert("g.exe".into(), Profile { version: 1, game: "g.exe".into(), name: "G".into(), updated: 0, entries: vec![entry("8.8.8.8/32"), pack.clone()] });
+        }
+        // saving a new reviewed selection replaces the servers but keeps the pack; input "pack" entries are ignored
+        let saved = store.save("g.exe", "G", vec![entry("9.9.9.9/32"), pack.clone()]).unwrap();
+        let cidrs: Vec<&str> = saved.entries.iter().map(|e| e.cidr.as_str()).collect();
+        assert_eq!(cidrs, vec!["9.9.9.9/32", "52.1.0.0/16"]);
+        assert_eq!(store.remove_pack("g.exe"), 1);
+        assert_eq!(store.list()[0].entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

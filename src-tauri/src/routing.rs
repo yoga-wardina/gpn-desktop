@@ -20,6 +20,10 @@ const IDLE_GRACE: Duration = Duration::from_secs(60);
 const DEBOUNCE: Duration = Duration::from_millis(1500);
 /// The server rejects more targets than this (default 64).
 const MAX_SERVER_IPS: usize = 60;
+/// Live-detected hosts kept routed once seen (leaves headroom under the server cap for profile hosts).
+const STICKY_CAP: usize = 40;
+/// With no game running for this long the remembered hosts are forgotten.
+const STICKY_FORGET: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Desired {
@@ -40,11 +44,19 @@ fn contains(cidr: &(Ipv4Addr, u8), ip: Ipv4Addr) -> bool {
 /// Build the desired route set from profiles of running games + live hosts.
 pub fn desired_routes(profiles: &[Profile], running: &HashSet<String>, live: &[Ipv4Addr]) -> Desired {
     let mut cidrs: Vec<(Ipv4Addr, u8)> = Vec::new();
+    // reviewed /32 hosts (not from a bundled range pack) — the only profile hosts worth telling the server about
+    let mut reviewed_hosts: Vec<Ipv4Addr> = Vec::new();
     for p in profiles.iter().filter(|p| running.contains(&p.game)) {
         for e in &p.entries {
             if let Some(c) = parse_cidr(&e.cidr) {
-                if is_public_ipv4(c.0) && !cidrs.contains(&c) {
+                if !is_public_ipv4(c.0) {
+                    continue;
+                }
+                if !cidrs.contains(&c) {
                     cidrs.push(c);
+                }
+                if c.1 == 32 && e.source != "pack" {
+                    reviewed_hosts.push(c.0);
                 }
             }
         }
@@ -58,7 +70,7 @@ pub fn desired_routes(profiles: &[Profile], running: &HashSet<String>, live: &[I
     profile_cidrs.sort();
 
     // server targets: /32 profile hosts first (they are what the user reviewed), then live hosts
-    let mut server: Vec<Ipv4Addr> = cidrs.iter().filter(|c| c.1 == 32).map(|c| c.0).collect();
+    let mut server: Vec<Ipv4Addr> = reviewed_hosts;
     server.extend(hosts.iter().copied());
     server.sort();
     server.dedup();
@@ -75,6 +87,44 @@ pub fn desired_routes(profiles: &[Profile], running: &HashSet<String>, live: &[I
     allowed.dedup();
 
     Desired { allowed, server_ips: server.iter().map(|i| i.to_string()).collect(), profile_cidrs }
+}
+
+/// Live hosts that stay routed after their connection ends.
+///
+/// MMOs hop between servers (a fresh instance server per dungeon, back to the hub afterwards). If a route
+/// disappeared the moment its connection closed, every hop would reconfigure the tunnel just as the next
+/// connection is opening — and that glitch is what kicks you. Routes therefore only ever get ADDED while
+/// a game runs (oldest evicted beyond `STICKY_CAP`) and are dropped once no game has run for a while.
+#[derive(Default)]
+pub struct Sticky {
+    seen: std::collections::HashMap<Ipv4Addr, Instant>,
+    idle_since: Option<Instant>,
+}
+
+impl Sticky {
+    pub fn update(&mut self, live_now: &[Ipv4Addr], game_running: bool) -> Vec<Ipv4Addr> {
+        self.update_at(live_now, game_running, Instant::now())
+    }
+
+    fn update_at(&mut self, live_now: &[Ipv4Addr], game_running: bool, now: Instant) -> Vec<Ipv4Addr> {
+        if !game_running {
+            let since = *self.idle_since.get_or_insert(now);
+            if now.duration_since(since) >= STICKY_FORGET {
+                self.seen.clear();
+            }
+            return live_now.to_vec();
+        }
+        self.idle_since = None;
+        for ip in live_now {
+            self.seen.insert(*ip, now);
+        }
+        while self.seen.len() > STICKY_CAP {
+            if let Some(oldest) = self.seen.iter().min_by_key(|(_, t)| **t).map(|(ip, _)| *ip) {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.seen.keys().copied().collect()
+    }
 }
 
 #[derive(Default)]
@@ -204,11 +254,57 @@ mod tests {
     }
 
     #[test]
+    fn pack_hosts_are_routed_but_not_sent_to_the_server() {
+        let mut p = prof("a.exe", &["8.8.8.8/32", "20.1.2.3/32", "20.0.0.0/16"]);
+        p.entries[1].source = "pack".into();
+        p.entries[2].source = "pack".into();
+        let d = desired_routes(&[p], &running(&["a.exe"]), &[]);
+        assert!(d.allowed.contains(&"20.1.2.3/32".to_string()) && d.allowed.contains(&"20.0.0.0/16".to_string()));
+        assert_eq!(d.server_ips, vec!["8.8.8.8"]);
+    }
+
+    #[test]
     fn live_hosts_covered_by_profile_are_not_duplicated() {
         let ps = [prof("a.exe", &["52.1.0.0/20"])];
         let d = desired_routes(&ps, &running(&["a.exe"]), &[ip("52.1.2.3"), ip("1.1.1.1"), ip("10.0.0.1")]);
         assert_eq!(d.allowed, vec!["1.1.1.1/32", "52.1.0.0/20"]);
         assert_eq!(d.server_ips, vec!["1.1.1.1", "52.1.2.3"]); // server still learns the covered live host
+    }
+
+    #[test]
+    fn sticky_hosts_survive_their_connection_and_expire_after_the_game() {
+        let t0 = Instant::now();
+        let mut s = Sticky::default();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let sorted = |mut v: Vec<Ipv4Addr>| {
+            v.sort();
+            v
+        };
+        // hub, then an instance server appears and the hub connection closes ...
+        assert_eq!(sorted(s.update_at(&[ip("4.189.34.143")], true, at(0))), vec![ip("4.189.34.143")]);
+        assert_eq!(s.update_at(&[ip("4.215.152.154")], true, at(10)).len(), 2);
+        // ... the instance ends and nothing is live for a moment: both stay routed
+        assert_eq!(s.update_at(&[], true, at(700)).len(), 2);
+        // the next hop only adds
+        assert_eq!(s.update_at(&[ip("40.81.221.196")], true, at(710)).len(), 3);
+        // game closed: remembered for a minute (a relaunch keeps its routes), then forgotten
+        assert!(s.update_at(&[], false, at(720)).is_empty());
+        assert_eq!(s.update_at(&[], true, at(740)).len(), 3);
+        assert!(s.update_at(&[], false, at(750)).is_empty());
+        s.update_at(&[], false, at(750 + 61));
+        assert!(s.update_at(&[], true, at(900)).is_empty());
+    }
+
+    #[test]
+    fn sticky_set_is_capped_and_evicts_the_oldest() {
+        let t0 = Instant::now();
+        let mut s = Sticky::default();
+        for n in 0..(STICKY_CAP as u64 + 5) {
+            s.update_at(&[ip(&format!("8.8.{n}.1"))], true, t0 + Duration::from_secs(n));
+        }
+        let kept = s.update_at(&[], true, t0 + Duration::from_secs(1000));
+        assert_eq!(kept.len(), STICKY_CAP);
+        assert!(!kept.contains(&ip("8.8.0.1")) && kept.contains(&ip(&format!("8.8.{}.1", STICKY_CAP + 4))));
     }
 
     #[test]

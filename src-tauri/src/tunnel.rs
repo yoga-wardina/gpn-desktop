@@ -193,7 +193,15 @@ impl TunnelManager {
         } else if running_allowed_ips().await.is_some_and(|r| r == allowed) {
             // already in sync
         } else {
-            reinstall(i).await?;
+            // Restarting the service drops every tunnelled connection for a second or two, which is
+            // enough to kick a game. Update the live interface instead; restart only if that fails.
+            match live_update(i, &allowed).await {
+                Ok(()) => log::info!("tunnel routes updated live (no restart)"),
+                Err(e) => {
+                    log::warn!("live route update failed ({e}); restarting the tunnel");
+                    reinstall(i).await?;
+                }
+            }
         }
         i.allowed = allowed;
         Ok(())
@@ -285,6 +293,49 @@ impl TunnelManager {
     }
 }
 
+/// (added, removed) between the running AllowedIPs and the wanted ones.
+pub fn diff_allowed(current: &[String], wanted: &[String]) -> (Vec<String>, Vec<String>) {
+    (
+        wanted.iter().filter(|c| !current.contains(c)).cloned().collect(),
+        current.iter().filter(|c| !wanted.contains(c)).cloned().collect(),
+    )
+}
+
+/// Does `netsh interface ipv4 show route` list `cidr` on the tunnel interface? (numeric, locale independent)
+pub fn route_present(netsh_out: &str, cidr: &str) -> bool {
+    netsh_out.lines().any(|l| {
+        let cols: Vec<&str> = l.split_whitespace().collect();
+        cols.contains(&cidr) && cols.last().is_some_and(|n| n.eq_ignore_ascii_case(TUNNEL_NAME))
+    })
+}
+
+/// Change the peer's AllowedIPs on the RUNNING interface and add/remove the matching routes ourselves
+/// (the WireGuard service only creates routes when it starts). Verifies both; any doubt => Err so the
+/// caller falls back to a full restart, which is always correct.
+async fn live_update(i: &Inner, wanted: &[String]) -> Result<(), String> {
+    let server_pub = i.server_pub.as_deref().ok_or("no server key")?;
+    let current = running_allowed_ips().await.ok_or("cannot read the running config")?;
+    let (added, removed) = diff_allowed(&current, wanted);
+
+    run(&wg_exe("wg.exe"), &["set", TUNNEL_NAME, "peer", server_pub, "allowed-ips", &wanted.join(",")], None, true).await?;
+    let iface = format!("interface={TUNNEL_NAME}");
+    for c in &added {
+        run("netsh", &["interface", "ipv4", "add", "route", &format!("prefix={c}"), &iface, "store=active"], None, true).await?;
+    }
+    for c in &removed {
+        let _ = run("netsh", &["interface", "ipv4", "delete", "route", &format!("prefix={c}"), &iface], None, false).await;
+    }
+
+    if running_allowed_ips().await.as_deref() != Some(wanted) {
+        return Err("allowed-ips did not take effect".into());
+    }
+    let routes = run("netsh", &["interface", "ipv4", "show", "route"], None, false).await.unwrap_or_default();
+    if let Some(missing) = added.iter().find(|c| !route_present(&routes, c)) {
+        return Err(format!("route {missing} was not installed"));
+    }
+    Ok(())
+}
+
 /// Is the tunnel service actually RUNNING? Updates `up`.
 async fn probe(i: &mut Inner) -> bool {
     i.up = run("sc", &["query", SERVICE], None, false).await.is_ok_and(|o| o.contains("RUNNING"));
@@ -352,5 +403,25 @@ mod tests {
         assert!(c.contains("AllowedIPs = 1.2.3.4/32, 52.1.0.0/20"));
         assert!(c.contains("Endpoint = vpn.example.com:51820"));
         assert!(!c.contains("DNS"));
+    }
+
+    #[test]
+    fn allowed_diff_is_added_and_removed() {
+        let cur: Vec<String> = ["1.1.1.1/32", "2.2.2.2/32"].iter().map(|s| s.to_string()).collect();
+        let want: Vec<String> = ["2.2.2.2/32", "3.3.3.3/32"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(diff_allowed(&cur, &want), (vec!["3.3.3.3/32".to_string()], vec!["1.1.1.1/32".to_string()]));
+        assert_eq!(diff_allowed(&cur, &cur), (vec![], vec![]));
+    }
+
+    #[test]
+    fn route_check_reads_netsh_output() {
+        let out = "Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name\n\
+-------  --------  ---  ------------------------  ---  ------------------------\n\
+No       Manual    256  203.0.113.50/32            23  gpn\n\
+No       Manual    0    0.0.0.0/0                  12  192.168.1.1\n\
+No       Manual    256  198.51.100.7/32            12  Ethernet\n";
+        assert!(route_present(out, "203.0.113.50/32"));
+        assert!(!route_present(out, "198.51.100.7/32")); // present, but on another interface
+        assert!(!route_present(out, "203.0.113.51/32"));
     }
 }
