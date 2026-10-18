@@ -17,7 +17,7 @@ interface TunnelView {
   tunnelUp: boolean;
   allowedIps: string[];
   handshakeAgeSecs: number | null;
-  dup?: { sent: number; received: number } | null;
+  dup?: { sent: number; received: number; downPairs: number; downSingles: number } | null;
   lastError: string | null;
 }
 interface State {
@@ -302,6 +302,28 @@ function heroModel(s: State): { state: "ok" | "busy" | "err" | "warn" | "idle"; 
   };
 }
 
+/** One copy missing from a pair means a packet lost on the link; about half of those were the first copy,
+ * the ones the backup copy actually rescued. */
+const savedDown = (d: { downSingles: number }) => Math.round(d.downSingles / 2);
+
+let dupServer: [number, number] | null = null;
+let dupServerAt = 0;
+
+function renderDupLive(s: State) {
+  const row = $("dupLiveRow");
+  const d = s.tunnel.dup;
+  row.style.display = d ? "" : "none";
+  if (!d) return;
+  const pct = (singles: number, pairs: number) => (singles + pairs ? ((100 * singles) / (2 * (singles + pairs))).toFixed(1) : "0.0");
+  const down = `<b>Downstream</b>: ${d.downSingles.toLocaleString()} of ${(d.downPairs + d.downSingles).toLocaleString()} packets lost a copy (${pct(d.downSingles, d.downPairs)}% link loss) → ~${savedDown(d).toLocaleString()} rescued`;
+  const up = dupServer ? `<br><b>Upstream</b>: ${dupServer[1].toLocaleString()} of ${(dupServer[0] + dupServer[1]).toLocaleString()} (${pct(dupServer[1], dupServer[0])}% link loss) → ~${Math.round(dupServer[1] / 2).toLocaleString()} rescued` : "";
+  $("dupLive").innerHTML = down + up;
+  if (Date.now() - dupServerAt > 5000 && view === "settings") {
+    dupServerAt = Date.now();
+    invoke<[number, number] | null>("dup_server_stats").then((r) => (dupServer = r), () => {});
+  }
+}
+
 function renderDashboard(s: State) {
   const h = heroModel(s);
   $("hero").dataset.state = h.state;
@@ -314,7 +336,7 @@ function renderDashboard(s: State) {
   const etw = { running: "On", denied: "Needs admin", error: "Error", off: "Off", unsupported: "N/A" }[s.etw.state];
   $("stats").innerHTML = (
     [
-      ["Servers routed", String(t.allowedIps.length), t.tunnelUp ? (t.dup ? "through the tunnel · packets doubled" : "through the tunnel") : "tunnel is down", false],
+      ["Servers routed", String(t.allowedIps.length), t.tunnelUp ? (t.dup ? `through the tunnel · packets doubled${savedDown(t.dup) ? ` · ~${savedDown(t.dup)} saved` : ""}` : "through the tunnel") : "tunnel is down", false],
       ["Handshake", t.tunnelUp ? (t.handshakeAgeSecs === null ? "waiting" : `${t.handshakeAgeSecs}s ago`) : "—", "last key exchange", false],
       ["VPN address", t.vpnIp ?? "—", t.registered ? "assigned by server" : "not registered", true],
       ["Traffic capture", etw, "UDP + TCP detection", false],
@@ -871,6 +893,7 @@ function renderSettings(s: State) {
   const url = $<HTMLInputElement>("serverUrl");
   if (!urlDirty && document.activeElement !== url) url.value = s.gpnServerUrl || "";
   $("insecureWarn").style.display = s.insecureUrl ? "" : "none";
+  renderDupLive(s);
   const dupOn = $<HTMLInputElement>("dupOn");
   const dupDelay = $<HTMLInputElement>("dupDelay");
   if (document.activeElement !== dupOn) dupOn.checked = !!s.dup?.enabled;

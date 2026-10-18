@@ -153,6 +153,13 @@ fn set_duplication(state: State<'_, AppState>, enabled: bool, delay_ms: u64) {
     });
 }
 
+/// What the server saw of our upstream packets (pairs = both copies arrived, singles = one was lost).
+#[tauri::command]
+async fn dup_server_stats(state: State<'_, AppState>) -> Result<Option<(u64, u64)>, String> {
+    let api = state.api.clone();
+    api.dup_server_stats().await
+}
+
 /// Measure UDP loss to the server's duplication relay: single copy vs. each packet sent twice.
 #[tauri::command]
 async fn udp_probe(state: State<'_, AppState>) -> Result<dup::ProbeResult, String> {
@@ -715,6 +722,7 @@ pub fn run() {
             get_state,
             set_duplication,
             udp_probe,
+            dup_server_stats,
             watch_game,
             unwatch_game,
             save_settings,

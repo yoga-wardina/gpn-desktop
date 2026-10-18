@@ -285,6 +285,16 @@ impl GpnApi {
     }
 
     /// The server's packet-duplication relay (host:port), if it runs one.
+    /// Relay counters kept by the server for upstream packets: (pairs, singles).
+    pub async fn dup_server_stats(&self) -> Result<Option<(u64, u64)>, String> {
+        let res = self.http.get(self.url("/api/health")).timeout(TIMEOUT).send().await.map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("HTTP {}", res.status()));
+        }
+        let v: Value = res.json().await.map_err(|e| e.to_string())?;
+        Ok(v["dupStats"]["upPairs"].as_u64().zip(v["dupStats"]["upSingles"].as_u64()))
+    }
+
     pub async fn dup_endpoint(&self) -> Result<Option<String>, String> {
         let res = self.http.get(self.url("/api/health")).timeout(TIMEOUT).send().await.map_err(|e| e.to_string())?;
         if !res.status().is_success() {

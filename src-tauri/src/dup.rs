@@ -7,6 +7,8 @@
 //!
 //! Also here: a UDP loss probe against the relay (`probe`), to see whether duplication is worth it.
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,12 +28,52 @@ pub struct DupStats {
     pub sent: u64,
     /// datagrams received from the server (before WireGuard drops the duplicates)
     pub received: u64,
+    /// downstream packets that arrived with both copies
+    pub down_pairs: u64,
+    /// downstream packets that arrived with only one copy (the other was lost on the way)
+    pub down_singles: u64,
 }
 
 #[derive(Default)]
 struct Counters {
     sent: AtomicU64,
     received: AtomicU64,
+    down_pairs: AtomicU64,
+    down_singles: AtomicU64,
+}
+
+/// How long to wait for a packet's second copy before counting it as a single.
+const PAIR_WINDOW: Duration = Duration::from_millis(300);
+
+/// Recognises the two copies of a downstream packet: seen twice = both arrived, once = one was lost.
+#[derive(Default)]
+pub struct PairTracker {
+    seen: HashMap<u64, (Instant, u8)>,
+}
+
+impl PairTracker {
+    pub fn note(&mut self, payload: &[u8], now: Instant) {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        payload.hash(&mut h);
+        self.seen.entry(h.finish()).and_modify(|e| e.1 = e.1.saturating_add(1)).or_insert((now, 1));
+    }
+
+    /// Retire entries older than the window; returns (pairs, singles) among them.
+    pub fn settle(&mut self, now: Instant) -> (u64, u64) {
+        let (mut pairs, mut singles) = (0, 0);
+        self.seen.retain(|_, (t, n)| {
+            if now.duration_since(*t) < PAIR_WINDOW {
+                return true;
+            }
+            if *n >= 2 {
+                pairs += 1;
+            } else {
+                singles += 1;
+            }
+            false
+        });
+        (pairs, singles)
+    }
 }
 
 /// Cheap handle to read a running proxy's counters.
@@ -40,7 +82,12 @@ pub struct StatsHandle(Arc<Counters>);
 
 impl StatsHandle {
     pub fn get(&self) -> DupStats {
-        DupStats { sent: self.0.sent.load(Ordering::Relaxed), received: self.0.received.load(Ordering::Relaxed) }
+        DupStats {
+            sent: self.0.sent.load(Ordering::Relaxed),
+            received: self.0.received.load(Ordering::Relaxed),
+            down_pairs: self.0.down_pairs.load(Ordering::Relaxed),
+            down_singles: self.0.down_singles.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -63,6 +110,7 @@ impl DupProxy {
         let counters = Arc::new(Counters::default());
         let wg_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
         let delay = Duration::from_millis(delay_ms.min(50));
+        let tracker = Arc::new(Mutex::new(PairTracker::default()));
 
         // WireGuard -> server, every datagram twice
         let t1 = {
@@ -89,12 +137,13 @@ impl DupProxy {
         };
         // server -> WireGuard (the relay already sends two copies; WireGuard drops the second)
         let t2 = {
-            let (local, up, counters) = (local.clone(), up.clone(), counters.clone());
+            let (local, up, counters, tracker) = (local.clone(), up.clone(), counters.clone(), tracker.clone());
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
                 loop {
                     let Ok(n) = up.recv(&mut buf).await else { continue };
                     counters.received.fetch_add(1, Ordering::Relaxed);
+                    tracker.lock().unwrap().note(&buf[..n], Instant::now());
                     let to = *wg_addr.lock().unwrap();
                     if let Some(to) = to {
                         let _ = local.send_to(&buf[..n], to).await;
@@ -102,7 +151,19 @@ impl DupProxy {
                 }
             })
         };
-        Ok(Self { local_port, counters, tasks: vec![t1, t2] })
+        // retire packets whose second copy never came
+        let t3 = {
+            let counters = counters.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let (p, s) = tracker.lock().unwrap().settle(Instant::now());
+                    counters.down_pairs.fetch_add(p, Ordering::Relaxed);
+                    counters.down_singles.fetch_add(s, Ordering::Relaxed);
+                }
+            })
+        };
+        Ok(Self { local_port, counters, tasks: vec![t1, t2, t3] })
     }
 
     pub fn handle(&self) -> StatsHandle {
@@ -225,6 +286,18 @@ pub async fn probe(server: &str, count: u32, interval_ms: u64, delay_ms: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pair_tracker_tells_pairs_from_singles() {
+        let t0 = Instant::now();
+        let mut t = PairTracker::default();
+        t.note(b"a", t0);
+        t.note(b"a", t0 + Duration::from_millis(3)); // both copies
+        t.note(b"b", t0); // one copy only
+        assert_eq!(t.settle(t0 + Duration::from_millis(100)), (0, 0)); // still inside the window
+        assert_eq!(t.settle(t0 + Duration::from_millis(400)), (1, 1));
+        assert_eq!(t.settle(t0 + Duration::from_secs(5)), (0, 0));
+    }
 
     #[test]
     fn probe_packets_round_trip() {
