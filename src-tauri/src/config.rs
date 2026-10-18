@@ -21,6 +21,10 @@ pub struct Config {
     pub game_ports: Vec<u16>,
     /// Tear the tunnel down after ~60s without game traffic.
     pub tunnel_teardown_when_idle: bool,
+    /// Send every WireGuard packet twice via the server's duplication relay (hides random packet loss).
+    pub packet_duplication: bool,
+    /// Gap between the two copies, in ms.
+    pub duplication_delay_ms: u64,
     /// Persistent WireGuard private key (keeps the same peer identity across restarts).
     pub wg_private_key: Option<String>,
     /// Logged-in user session.
@@ -38,6 +42,8 @@ impl Default for Config {
                 games: Vec::new(),
                 game_ports: Vec::new(),
                 tunnel_teardown_when_idle: true,
+                packet_duplication: false,
+                duplication_delay_ms: 3,
                 wg_private_key: None,
                 auth: None,
             }

@@ -18,6 +18,8 @@ Tauri 2 (Rust backend + vanilla TypeScript UI), frameless desktop-style window.
 - **Learn mode + profiles**: records every public server a game talks to (traffic, play sessions, AS / BGP
   prefix via Team Cymru whois), with a per-session **Timeline**. You tick the real game servers and save a
   **profile**; export as JSON.
+- **Packet loss protection (experimental)**: sends every tunnel packet twice to the server's duplication relay so
+  random loss on your own connection never reaches the game; see *Packet duplication*.
 - **Sticky routes + live route updates**: see *Tunnel*. Prevents the "kicked when moving from an instance to
   the open world" problem.
 - **Range packs**: a profile can carry a bundled range list (e.g. a whole cloud region) that is pre-routed
@@ -89,6 +91,23 @@ fallback when logged out.
 - The tunnel is torn down after ~60 s with no game traffic (`tunnel_teardown_when_idle`), on logout and on
   quit. A tunnel left running by a crash is adopted on start.
 
+## Packet duplication
+
+For links with random packet loss between you and the VPS. WireGuard is pointed at a small local UDP proxy,
+which sends each datagram to the server's relay twice (default 3 ms apart); the server's WireGuard drops the
+repeat via replay protection, and the relay duplicates replies back. A packet is lost only if both copies are.
+
+1. Server: set `dupPort` (e.g. `51821`) in `server.config.json`, `ufw allow 51821/udp`, restart (see its README).
+2. App: *Settings → Packet loss protection → Run test* sends 200 UDP probes and reports loss with one copy vs. two.
+   Only turn it on if the test shows real loss and a clear improvement (ICMP loss can be rate-limiting, not real).
+3. Enable it; it applies the next time the tunnel starts (a running tunnel is never restarted, which would
+   kick games). Dashboard shows "packets doubled" while active.
+
+Costs double upstream/downstream bandwidth on the PC ↔ VPS leg only. It cannot help when both copies are lost
+together (a congested hop); spacing them further apart helps a little. `packet_duplication` and
+`duplication_delay_ms` in `gpn.config.json` hold the settings. A tunnel left running by a crash while
+duplication was on is removed at the next start (its local proxy died with the app).
+
 ## Known limitations
 
 - Entering a server outside your profile and packs (a new region or another cloud) can still cause one
@@ -141,4 +160,4 @@ The file also holds `wg_private_key` and `auth` (the session); don't share it.
 - `POST /api/register` `{publicKey,name}` -> `{ip,serverPublicKey,endpoint}`
 - `POST /api/targets` `{targets:[{ip}]}` with `Authorization: Bearer …` and `x-gpn-peer: <wg public key>`
 - `POST/GET /api/probe` — server-side latency/loss to game servers on your target list
-- `GET /api/health` — used by "Test connection"
+- `GET /api/health` — used by "Test connection"; its `dup` field names the duplication relay

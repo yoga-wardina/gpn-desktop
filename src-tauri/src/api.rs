@@ -284,6 +284,16 @@ impl GpnApi {
         serde_json::from_str(&text).map_err(|e| format!("bad server response: {e}"))
     }
 
+    /// The server's packet-duplication relay (host:port), if it runs one.
+    pub async fn dup_endpoint(&self) -> Result<Option<String>, String> {
+        let res = self.http.get(self.url("/api/health")).timeout(TIMEOUT).send().await.map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("HTTP {}", res.status()));
+        }
+        let v: Value = res.json().await.map_err(|e| e.to_string())?;
+        Ok(v["dup"].as_str().map(str::to_string))
+    }
+
     pub async fn ping(&self) -> Result<String, String> {
         let res = self.http.get(self.url("/api/health")).timeout(TIMEOUT).send().await.map_err(|e| e.to_string())?;
         if res.status().is_success() {

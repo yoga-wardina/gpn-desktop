@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::api::GpnApi;
 use crate::config::ConfigStore;
+use crate::dup::{DupProxy, DupStats, StatsHandle};
 use crate::proc::{restrict_file, run};
 
 const WG_DIR: &str = r"C:\Program Files\WireGuard";
@@ -42,6 +43,8 @@ pub struct TunnelView {
     pub handshake_age_secs: Option<u64>,
     /// the GPN server's public WireGuard endpoint (host:port) once registered
     pub endpoint: Option<String>,
+    /// set while packet duplication is active (WireGuard talks to a local proxy): the proxy's counters
+    pub dup: Option<DupStats>,
     pub last_error: Option<String>,
 }
 
@@ -52,6 +55,12 @@ struct Inner {
     vpn_ip: Option<String>,
     server_pub: Option<String>,
     endpoint: Option<String>,
+    /// the server's duplication relay (host:port), when it runs one
+    dup_endpoint: Option<String>,
+    /// local proxy WireGuard talks to while duplication is on (kept as long as the tunnel is up)
+    dup: Option<DupProxy>,
+    /// the Endpoint written to the tunnel config that is installed
+    conf_endpoint: Option<String>,
     /// AllowedIPs of the running tunnel (CIDRs, sorted)
     allowed: Vec<String>,
     /// /32 hosts last synced to the server (sorted)
@@ -65,6 +74,7 @@ pub struct TunnelManager {
     cfg: Arc<ConfigStore>,
     inner: tokio::sync::Mutex<Inner>,
     view: Mutex<TunnelView>,
+    dup_stats: Mutex<Option<StatsHandle>>,
 }
 
 fn now_secs() -> u64 {
@@ -107,11 +117,13 @@ pub fn parse_allowed_ips(out: &str) -> Vec<String> {
 
 impl TunnelManager {
     pub fn new(api: Arc<GpnApi>, cfg: Arc<ConfigStore>) -> Self {
-        Self { api, cfg, inner: tokio::sync::Mutex::new(Inner::default()), view: Mutex::new(TunnelView::default()) }
+        Self { api, cfg, inner: tokio::sync::Mutex::new(Inner::default()), view: Mutex::new(TunnelView::default()), dup_stats: Mutex::new(None) }
     }
 
     pub fn view(&self) -> TunnelView {
-        self.view.lock().unwrap().clone()
+        let mut v = self.view.lock().unwrap().clone();
+        v.dup = self.dup_stats.lock().unwrap().as_ref().map(|h| h.get());
+        v
     }
 
     fn publish(&self, i: &Inner, err: Option<String>) {
@@ -130,7 +142,12 @@ impl TunnelManager {
     /// Adopt a tunnel service left running by a previous run (crash / restart).
     pub async fn init(&self) {
         let mut i = self.inner.lock().await;
-        if probe(&mut i).await {
+        if probe(&mut i).await && conf_uses_loopback() {
+            // a previous run used packet duplication; its proxy died with that run, so the tunnel points nowhere
+            log::info!("removing a tunnel left over from a duplication session");
+            uninstall().await;
+            i.up = false;
+        } else if i.up {
             i.up_since = Some(Instant::now());
             i.allowed = running_allowed_ips().await.unwrap_or_default();
             log::info!("adopted running tunnel ({} allowed entr(ies))", i.allowed.len());
@@ -174,12 +191,16 @@ impl TunnelManager {
             return Ok(());
         }
 
+        let (conf_endpoint, dup_warn) = self.pick_endpoint(i).await;
+        if dup_warn.is_some() {
+            *warn = dup_warn;
+        }
         let conf = build_conf(
             i.priv_key.as_deref().unwrap(),
             i.vpn_ip.as_deref().unwrap(),
             i.server_pub.as_deref().unwrap(),
             &allowed,
-            i.endpoint.as_deref().unwrap(),
+            &conf_endpoint,
         );
         let path = conf_path();
         if let Some(dir) = path.parent() {
@@ -203,8 +224,41 @@ impl TunnelManager {
                 }
             }
         }
+        i.conf_endpoint = Some(conf_endpoint);
         i.allowed = allowed;
         Ok(())
+    }
+
+    /// The Endpoint for the tunnel config. A running tunnel keeps whatever it was installed with; a fresh
+    /// install decides now: the local duplication proxy when it is enabled and the server has a relay,
+    /// otherwise the server directly.
+    async fn pick_endpoint(&self, i: &mut Inner) -> (String, Option<String>) {
+        let real = i.endpoint.clone().unwrap_or_default();
+        if i.up {
+            return (i.conf_endpoint.clone().unwrap_or(real), None);
+        }
+        let (want, delay) = {
+            let c = self.cfg.config.lock().unwrap();
+            (c.packet_duplication, c.duplication_delay_ms)
+        };
+        i.dup = None;
+        *self.dup_stats.lock().unwrap() = None;
+        if !want {
+            return (real, None);
+        }
+        let Some(relay) = i.dup_endpoint.clone() else {
+            return (real, Some("packet duplication is on, but this server has no duplication relay (set dupPort on the server)".into()));
+        };
+        match DupProxy::start(&relay, delay).await {
+            Ok(p) => {
+                let ep = format!("127.0.0.1:{}", p.local_port);
+                *self.dup_stats.lock().unwrap() = Some(p.handle());
+                i.dup = Some(p);
+                log::info!("packet duplication on: {ep} -> {relay} ({delay} ms apart)");
+                (ep, None)
+            }
+            Err(e) => (real, Some(format!("packet duplication unavailable: {e}"))),
+        }
     }
 
     async fn ensure_keys(&self, i: &mut Inner) -> Result<(), String> {
@@ -233,6 +287,7 @@ impl TunnelManager {
         i.vpn_ip = Some(field("ip").ok_or("register: server returned no ip")?);
         i.server_pub = Some(field("serverPublicKey").ok_or("register: server returned no serverPublicKey")?);
         i.endpoint = Some(field("endpoint").ok_or("register: server returned no endpoint")?);
+        i.dup_endpoint = field("dupEndpoint");
         Ok(())
     }
 
@@ -257,6 +312,9 @@ impl TunnelManager {
         }
         uninstall().await;
         i.up = false;
+        i.dup = None;
+        i.conf_endpoint = None;
+        *self.dup_stats.lock().unwrap() = None;
         i.allowed.clear();
         i.server_ips.clear();
         self.publish(&i, None);
@@ -337,6 +395,11 @@ async fn live_update(i: &Inner, wanted: &[String]) -> Result<(), String> {
 }
 
 /// Is the tunnel service actually RUNNING? Updates `up`.
+/// Does the installed tunnel config point WireGuard at a local (duplication) proxy?
+fn conf_uses_loopback() -> bool {
+    std::fs::read_to_string(conf_path()).is_ok_and(|c| c.lines().any(|l| l.trim_start().starts_with("Endpoint") && l.contains("127.0.0.1")))
+}
+
 async fn probe(i: &mut Inner) -> bool {
     i.up = run("sc", &["query", SERVICE], None, false).await.is_ok_and(|o| o.contains("RUNNING"));
     i.up

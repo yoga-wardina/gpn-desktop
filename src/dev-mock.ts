@@ -29,7 +29,8 @@ const state: any = {
   auth: { username: "akmal", role: "admin" },
   hasToken: false,
   insecureUrl: false,
-  tunnel: { registered: true, vpnIp: "10.66.0.2", tunnelUp: true, allowedIps: ["203.0.113.50", "198.51.100.7", "52.84.12.9"], handshakeAgeSecs: 38, lastError: null },
+  tunnel: { registered: true, vpnIp: "10.66.0.2", tunnelUp: true, allowedIps: ["203.0.113.50", "198.51.100.7", "52.84.12.9"], handshakeAgeSecs: 38, dup: null, lastError: null },
+  dup: { enabled: false, delayMs: 3 },
 };
 
 const running = { pid: 4242, name: "AION2.exe", game: "aion2.exe" };
@@ -128,6 +129,8 @@ w.__TAURI_INTERNALS__ = {
       case "unwatch_game": state.watched = state.watched.filter((g: string) => g !== args.exe); return null;
       case "save_settings": if (args.serverUrl) state.gpnServerUrl = args.serverUrl; return null;
       case "ping_server": return "ok";
+      case "set_duplication": state.dup = { enabled: args.enabled, delayMs: args.delayMs }; return null;
+      case "udp_probe": await new Promise((r) => setTimeout(r, 1200)); return { sent: 200, singleLossPct: 1.5, dupLossPct: 0, avgRttMs: 27.4, jitterMs: 1.2, delayMs: 3 };
       case "auth_login":
         if (args.password === "bad") throw "invalid credentials";
         state.auth = { username: args.username, role: "user" };

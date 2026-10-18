@@ -1,6 +1,7 @@
 mod api;
 mod asn;
 mod config;
+mod dup;
 mod etw;
 mod latency;
 mod learn;
@@ -97,6 +98,7 @@ fn state_json(state: &AppState) -> serde_json::Value {
         "hasToken": state.api.has_credentials(),
         "insecureUrl": !api::is_secure_or_local(&state.api.server_url()),
         "tunnel": state.tunnel.view(),
+        "dup": { "enabled": state.cfg.config.lock().unwrap().packet_duplication, "delayMs": state.cfg.config.lock().unwrap().duplication_delay_ms },
     })
 }
 
@@ -139,6 +141,25 @@ async fn save_settings(app: AppHandle, server_url: String, token: Option<String>
         state.api.set_token(&t);
     }
     Ok(())
+}
+
+/// Turn packet duplication on/off. A running tunnel keeps its endpoint: this takes effect the next time
+/// the tunnel starts (it stops by itself ~60 s after the game closes).
+#[tauri::command]
+fn set_duplication(state: State<'_, AppState>, enabled: bool, delay_ms: u64) {
+    state.cfg.update(|c| {
+        c.packet_duplication = enabled;
+        c.duplication_delay_ms = delay_ms.clamp(0, 50);
+    });
+}
+
+/// Measure UDP loss to the server's duplication relay: single copy vs. each packet sent twice.
+#[tauri::command]
+async fn udp_probe(state: State<'_, AppState>) -> Result<dup::ProbeResult, String> {
+    let api = state.api.clone();
+    let delay = state.cfg.config.lock().unwrap().duplication_delay_ms;
+    let relay = api.dup_endpoint().await?.ok_or("this server has no duplication relay (set dupPort on the server and open that UDP port)")?;
+    dup::probe(&relay, 200, 50, delay).await
 }
 
 #[tauri::command]
@@ -692,6 +713,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            set_duplication,
+            udp_probe,
             watch_game,
             unwatch_game,
             save_settings,

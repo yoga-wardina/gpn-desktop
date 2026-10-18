@@ -17,6 +17,7 @@ interface TunnelView {
   tunnelUp: boolean;
   allowedIps: string[];
   handshakeAgeSecs: number | null;
+  dup?: { sent: number; received: number } | null;
   lastError: string | null;
 }
 interface State {
@@ -31,6 +32,7 @@ interface State {
   hasToken: boolean;
   insecureUrl: boolean;
   tunnel: TunnelView;
+  dup?: { enabled: boolean; delayMs: number };
 }
 interface Asn { asn: number; prefix: string; cc: string; name: string }
 interface Episode { session: number; first: number; last: number }
@@ -312,7 +314,7 @@ function renderDashboard(s: State) {
   const etw = { running: "On", denied: "Needs admin", error: "Error", off: "Off", unsupported: "N/A" }[s.etw.state];
   $("stats").innerHTML = (
     [
-      ["Servers routed", String(t.allowedIps.length), t.tunnelUp ? "through the tunnel" : "tunnel is down", false],
+      ["Servers routed", String(t.allowedIps.length), t.tunnelUp ? (t.dup ? "through the tunnel · packets doubled" : "through the tunnel") : "tunnel is down", false],
       ["Handshake", t.tunnelUp ? (t.handshakeAgeSecs === null ? "waiting" : `${t.handshakeAgeSecs}s ago`) : "—", "last key exchange", false],
       ["VPN address", t.vpnIp ?? "—", t.registered ? "assigned by server" : "not registered", true],
       ["Traffic capture", etw, "UDP + TCP detection", false],
@@ -869,6 +871,10 @@ function renderSettings(s: State) {
   const url = $<HTMLInputElement>("serverUrl");
   if (!urlDirty && document.activeElement !== url) url.value = s.gpnServerUrl || "";
   $("insecureWarn").style.display = s.insecureUrl ? "" : "none";
+  const dupOn = $<HTMLInputElement>("dupOn");
+  const dupDelay = $<HTMLInputElement>("dupDelay");
+  if (document.activeElement !== dupOn) dupOn.checked = !!s.dup?.enabled;
+  if (document.activeElement !== dupDelay) dupDelay.value = String(s.dup?.delayMs ?? 3);
   const chip = $("serverChip");
   chip.className = "chip dot " + (serverState === "ok" ? "ok" : serverState === "fail" ? "err" : "");
   chip.textContent = serverState === "ok" ? "Reachable" : serverState === "fail" ? "Unreachable" : "Not tested";
@@ -1249,6 +1255,33 @@ function wire() {
       toast(errText(e), "err");
     }
     if (S) renderSettings(S);
+  });
+
+  // packet duplication
+  const saveDup = async () => {
+    const delay = Math.max(0, Math.min(50, Number($<HTMLInputElement>("dupDelay").value) || 0));
+    try {
+      await invoke("set_duplication", { enabled: $<HTMLInputElement>("dupOn").checked, delayMs: delay });
+      toast($<HTMLInputElement>("dupOn").checked ? "Packet duplication on - applies when the tunnel next starts" : "Packet duplication off", "ok");
+      void refresh();
+    } catch (e) {
+      toast(errText(e), "err");
+    }
+  };
+  $("dupOn").addEventListener("change", saveDup);
+  $("dupDelay").addEventListener("change", saveDup);
+  $("dupTest").addEventListener("click", async () => {
+    const btn = $<HTMLButtonElement>("dupTest");
+    btn.disabled = true;
+    $("dupResult").textContent = "Testing… about 10 seconds";
+    try {
+      const r = await invoke<{ sent: number; singleLossPct: number; dupLossPct: number; avgRttMs: number; jitterMs: number; delayMs: number }>("udp_probe");
+      const verdict = r.singleLossPct === 0 ? "No loss on this link right now - duplication wouldn't help." : r.dupLossPct < r.singleLossPct ? `Duplication would cut it to ${r.dupLossPct}%.` : "Duplication would not help (losses happen together).";
+      $("dupResult").textContent = `UDP to your server: ${r.singleLossPct}% loss with one copy, ${r.dupLossPct}% with two (${r.delayMs} ms apart) · ${r.avgRttMs} ms, jitter ${r.jitterMs} ms. ${verdict}`;
+    } catch (e) {
+      $("dupResult").textContent = errText(e);
+    }
+    btn.disabled = false;
   });
 
   // sign-in
