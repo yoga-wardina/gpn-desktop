@@ -21,6 +21,10 @@ pub struct Config {
     pub game_ports: Vec<u16>,
     /// Tear the tunnel down after ~60s without game traffic.
     pub tunnel_teardown_when_idle: bool,
+    /// The minimize button hides the window to the tray instead of the taskbar.
+    pub minimize_to_tray: bool,
+    /// The close button hides the window to the tray (the app keeps running) instead of quitting.
+    pub close_to_tray: bool,
     /// Send every WireGuard packet twice via the server's duplication relay (hides random packet loss).
     pub packet_duplication: bool,
     /// Gap between the two copies, in ms.
@@ -42,6 +46,8 @@ impl Default for Config {
                 games: Vec::new(),
                 game_ports: Vec::new(),
                 tunnel_teardown_when_idle: true,
+                minimize_to_tray: true,
+                close_to_tray: false,
                 packet_duplication: false,
                 duplication_delay_ms: 3,
                 wg_private_key: None,

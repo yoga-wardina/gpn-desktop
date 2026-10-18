@@ -25,7 +25,8 @@ Tauri 2 (Rust backend + vanilla TypeScript UI), frameless desktop-style window.
 - **Range packs**: a profile can carry a bundled range list (e.g. a whole cloud region) that is pre-routed
   whenever the game runs; survives re-saving the reviewed servers.
 - Game name and 256px icon resolved from the exe's version info (cached, re-resolved when stale).
-- Account login / register against the GPN server, system tray (Open / Quit).
+- Account login / register against the GPN server, system tray (Open / Quit). *Settings → Window*:
+  **minimize to tray** (default on) and **close hides to tray** (default off; off = the X quits and stops the tunnel).
 - Themes: Toxic (default), Crimson, Graphite, Midnight, Forest, Light, System; normal (1280×820, fixed) or
   full-window mode. Window position is remembered.
 
@@ -101,7 +102,11 @@ repeat via replay protection, and the relay duplicates replies back. A packet is
 2. App: *Settings → Packet loss protection → Run test* sends 200 UDP probes and reports loss with one copy vs. two.
    Only turn it on if the test shows real loss and a clear improvement (ICMP loss can be rate-limiting, not real).
 3. Enable it; it applies the next time the tunnel starts (a running tunnel is never restarted, which would
-   kick games). Dashboard shows "packets doubled" while active.
+   kick games). While active, the Dashboard has a **Packet loss protection** card: ~packets rescued this
+   session, link loss per direction (downstream counted in the app, upstream by the server, so it needs the
+   updated server), packets sent/received, and a link-loss-over-time chart. A packet that arrives with only
+   one of its two copies means one copy was lost; about half of those were the first copy, which is what the
+   backup copy rescued (hence the "~"). Both-copies-lost packets are invisible by definition.
 
 Costs double upstream/downstream bandwidth on the PC ↔ VPS leg only. It cannot help when both copies are lost
 together (a congested hop); spacing them further apart helps a little. `packet_duplication` and

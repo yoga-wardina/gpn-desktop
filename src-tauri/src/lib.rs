@@ -98,6 +98,7 @@ fn state_json(state: &AppState) -> serde_json::Value {
         "hasToken": state.api.has_credentials(),
         "insecureUrl": !api::is_secure_or_local(&state.api.server_url()),
         "tunnel": state.tunnel.view(),
+        "tray": { "minimize": state.cfg.config.lock().unwrap().minimize_to_tray, "close": state.cfg.config.lock().unwrap().close_to_tray },
         "dup": { "enabled": state.cfg.config.lock().unwrap().packet_duplication, "delayMs": state.cfg.config.lock().unwrap().duplication_delay_ms },
     })
 }
@@ -141,6 +142,22 @@ async fn save_settings(app: AppHandle, server_url: String, token: Option<String>
         state.api.set_token(&t);
     }
     Ok(())
+}
+
+/// Hide the main window to the tray (the app and its tunnel keep running).
+#[tauri::command]
+fn hide_to_tray(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+}
+
+#[tauri::command]
+fn set_tray(state: State<'_, AppState>, minimize: bool, close: bool) {
+    state.cfg.update(|c| {
+        c.minimize_to_tray = minimize;
+        c.close_to_tray = close;
+    });
 }
 
 /// Turn packet duplication on/off. A running tunnel keeps its endpoint: this takes effect the next time
@@ -651,6 +668,16 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default()
             .with_state_flags(tauri_plugin_window_state::StateFlags::POSITION)
             .build())
+        .on_window_event(|window, event| {
+            // with "close hides to tray" the X button keeps the app (and its tunnel) running
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let hide = window.app_handle().try_state::<AppState>().is_some_and(|s| s.cfg.config.lock().unwrap().close_to_tray);
+                if hide {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             let data_dir = app.path().app_data_dir()?;
@@ -721,6 +748,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             set_duplication,
+            hide_to_tray,
+            set_tray,
             udp_probe,
             dup_server_stats,
             watch_game,

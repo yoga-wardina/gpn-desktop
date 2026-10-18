@@ -33,6 +33,7 @@ interface State {
   insecureUrl: boolean;
   tunnel: TunnelView;
   dup?: { enabled: boolean; delayMs: number };
+  tray?: { minimize: boolean; close: boolean };
 }
 interface Asn { asn: number; prefix: string; cc: string; name: string }
 interface Episode { session: number; first: number; last: number }
@@ -251,7 +252,9 @@ function render(s: State) {
   S = s;
   renderChrome(s);
   renderGate(s);
+  trackLoss(s.tunnel.dup);
   renderDashboard(s);
+  renderDupCard(s);
   renderGames(s);
   renderLearnHeader(s);
   renderSettings(s);
@@ -302,26 +305,69 @@ function heroModel(s: State): { state: "ok" | "busy" | "err" | "warn" | "idle"; 
   };
 }
 
-/** One copy missing from a pair means a packet lost on the link; about half of those were the first copy,
- * the ones the backup copy actually rescued. */
-const savedDown = (d: { downSingles: number }) => Math.round(d.downSingles / 2);
-
 let dupServer: [number, number] | null = null;
 let dupServerAt = 0;
 
-function renderDupLive(s: State) {
-  const row = $("dupLiveRow");
+/** Link loss implied by pair/single counts: each lost copy shows up as a single. */
+const copyLossPct = (singles: number, pairs: number) => (singles + pairs ? (100 * singles) / (2 * (singles + pairs)) : 0);
+
+/** Link loss per refresh, from the change in the downstream counters (newest last). */
+let lossHist: number[] = [];
+let lastDup: { singles: number; pairs: number } | null = null;
+
+function trackLoss(d: { downSingles: number; downPairs: number } | null | undefined) {
+  if (!d) {
+    lossHist = [];
+    lastDup = null;
+    return;
+  }
+  if (lastDup && (d.downSingles < lastDup.singles || d.downPairs < lastDup.pairs)) lossHist = []; // counters restarted
+  if (lastDup) {
+    const ds = d.downSingles - lastDup.singles;
+    const dp = d.downPairs - lastDup.pairs;
+    if (ds + dp >= 8) lossHist.push(copyLossPct(Math.max(0, ds), Math.max(0, dp)));
+    if (lossHist.length > 60) lossHist.shift();
+  }
+  lastDup = { singles: d.downSingles, pairs: d.downPairs };
+}
+
+function renderDupCard(s: State) {
+  const card = $("dupCard");
+  const enabled = !!s.dup?.enabled;
   const d = s.tunnel.dup;
-  row.style.display = d ? "" : "none";
-  if (!d) return;
-  const pct = (singles: number, pairs: number) => (singles + pairs ? ((100 * singles) / (2 * (singles + pairs))).toFixed(1) : "0.0");
-  const down = `<b>Downstream</b>: ${d.downSingles.toLocaleString()} of ${(d.downPairs + d.downSingles).toLocaleString()} packets lost a copy (${pct(d.downSingles, d.downPairs)}% link loss) → ~${savedDown(d).toLocaleString()} rescued`;
-  const up = dupServer ? `<br><b>Upstream</b>: ${dupServer[1].toLocaleString()} of ${(dupServer[0] + dupServer[1]).toLocaleString()} (${pct(dupServer[1], dupServer[0])}% link loss) → ~${Math.round(dupServer[1] / 2).toLocaleString()} rescued` : "";
-  $("dupLive").innerHTML = down + up;
-  if (Date.now() - dupServerAt > 5000 && view === "settings") {
+  card.style.display = enabled || d ? "" : "none";
+  if (!(enabled || d)) return;
+  const chip = $("dupState");
+  const state = d ? "active" : s.tunnel.tunnelUp ? "next start" : "ready";
+  chip.className = "chip dot " + (d ? "ok" : "");
+  chip.textContent = d ? "Active" : s.tunnel.tunnelUp ? "Starts with the next tunnel" : "Ready — starts with the next game";
+  if (!d) {
+    $("dupBody").innerHTML = `<div class="dim small">${state === "next start" ? "The tunnel is already running without it. Close the game and let the tunnel stop (about a minute), or quit and reopen GPN, then start the game." : "Every packet will be sent twice while a game runs, and the counters appear here."}</div>`;
+    return;
+  }
+  // downstream is counted here; upstream is counted by the server and fetched every few seconds
+  if (Date.now() - dupServerAt > 5000 && view === "dashboard") {
     dupServerAt = Date.now();
     invoke<[number, number] | null>("dup_server_stats").then((r) => (dupServer = r), () => {});
   }
+  const dn = { p: d.downPairs, s: d.downSingles };
+  const up = dupServer ? { p: dupServer[0], s: dupServer[1] } : null;
+  const saved = Math.round(dn.s / 2) + (up ? Math.round(up.s / 2) : 0);
+  const worst = Math.max(5, ...lossHist);
+  const bars = lossHist.length
+    ? lossHist.map((v) => `<i style="height:${Math.max(4, Math.round((100 * v) / worst))}%" title="${fmtPct(v)} link loss"></i>`).join("")
+    : `<span class="dim small">collecting…</span>`;
+  const cell = (k: string, v: string, sub: string) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`;
+  $("dupBody").innerHTML = `
+    <div class="dupgrid">
+      <div class="dupsaved"><div class="k">Packets rescued this session</div><div class="big">~${saved.toLocaleString()}</div><div class="s">lost on your link, delivered by the backup copy</div></div>
+      <div class="dupcells">
+        ${cell("Link loss ↓ from server", fmtPct(copyLossPct(dn.s, dn.p)), `${dn.s.toLocaleString()} of ${(dn.p + dn.s).toLocaleString()} packets lost a copy`)}
+        ${cell("Link loss ↑ to server", up ? fmtPct(copyLossPct(up.s, up.p)) : "—", up ? `${up.s.toLocaleString()} of ${(up.p + up.s).toLocaleString()} packets lost a copy` : "needs the updated server")}
+        ${cell("Sent / received", `${d.sent.toLocaleString()} / ${d.received.toLocaleString()}`, `every packet sent twice · ${s.dup?.delayMs ?? 0} ms apart`)}
+      </div>
+    </div>
+    <div class="duphist"><div class="k">Link loss over time <span class="faint">(each bar ≈ 3 s, without protection)</span></div><div class="bars">${bars}</div></div>`;
 }
 
 function renderDashboard(s: State) {
@@ -336,7 +382,7 @@ function renderDashboard(s: State) {
   const etw = { running: "On", denied: "Needs admin", error: "Error", off: "Off", unsupported: "N/A" }[s.etw.state];
   $("stats").innerHTML = (
     [
-      ["Servers routed", String(t.allowedIps.length), t.tunnelUp ? (t.dup ? `through the tunnel · packets doubled${savedDown(t.dup) ? ` · ~${savedDown(t.dup)} saved` : ""}` : "through the tunnel") : "tunnel is down", false],
+      ["Servers routed", String(t.allowedIps.length), t.tunnelUp ? (t.dup ? "through the tunnel · packets doubled" : "through the tunnel") : "tunnel is down", false],
       ["Handshake", t.tunnelUp ? (t.handshakeAgeSecs === null ? "waiting" : `${t.handshakeAgeSecs}s ago`) : "—", "last key exchange", false],
       ["VPN address", t.vpnIp ?? "—", t.registered ? "assigned by server" : "not registered", true],
       ["Traffic capture", etw, "UDP + TCP detection", false],
@@ -893,9 +939,12 @@ function renderSettings(s: State) {
   const url = $<HTMLInputElement>("serverUrl");
   if (!urlDirty && document.activeElement !== url) url.value = s.gpnServerUrl || "";
   $("insecureWarn").style.display = s.insecureUrl ? "" : "none";
-  renderDupLive(s);
   const dupOn = $<HTMLInputElement>("dupOn");
   const dupDelay = $<HTMLInputElement>("dupDelay");
+  const trayMin = $<HTMLInputElement>("trayMin");
+  const trayClose = $<HTMLInputElement>("trayClose");
+  if (document.activeElement !== trayMin) trayMin.checked = !!s.tray?.minimize;
+  if (document.activeElement !== trayClose) trayClose.checked = !!s.tray?.close;
   if (document.activeElement !== dupOn) dupOn.checked = !!s.dup?.enabled;
   if (document.activeElement !== dupDelay) dupDelay.value = String(s.dup?.delayMs ?? 3);
   const chip = $("serverChip");
@@ -1079,7 +1128,7 @@ async function windowChrome() {
       busy = false;
     }
   };
-  $("winMin").addEventListener("click", () => void win.minimize());
+  $("winMin").addEventListener("click", () => void (S?.tray?.minimize ? invoke("hide_to_tray") : win.minimize()));
   $("winMax").addEventListener("click", () => void toggleFull());
   // leave full-window mode first so the saved window position is the normal one, not the maximized one
   $("winClose").addEventListener("click", async () => {
@@ -1279,6 +1328,18 @@ function wire() {
     }
     if (S) renderSettings(S);
   });
+
+  // tray behaviour
+  const saveTray = async () => {
+    try {
+      await invoke("set_tray", { minimize: $<HTMLInputElement>("trayMin").checked, close: $<HTMLInputElement>("trayClose").checked });
+      void refresh();
+    } catch (e) {
+      toast(errText(e), "err");
+    }
+  };
+  $("trayMin").addEventListener("change", saveTray);
+  $("trayClose").addEventListener("change", saveTray);
 
   // packet duplication
   const saveDup = async () => {

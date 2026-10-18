@@ -30,7 +30,8 @@ const state: any = {
   hasToken: false,
   insecureUrl: false,
   tunnel: { registered: true, vpnIp: "10.66.0.2", tunnelUp: true, allowedIps: ["203.0.113.50", "198.51.100.7", "52.84.12.9"], handshakeAgeSecs: 38, dup: { sent: 18200, received: 18100, downPairs: 17650, downSingles: 380 }, lastError: null },
-  dup: { enabled: false, delayMs: 3 },
+  dup: { enabled: true, delayMs: 8 },
+  tray: { minimize: true, close: false },
 };
 
 const running = { pid: 4242, name: "AION2.exe", game: "aion2.exe" };
@@ -120,6 +121,7 @@ w.__TAURI_INTERNALS__ = {
     switch (cmd) {
       case "get_state": {
         if (state.tunnel.tunnelUp) state.tunnel.handshakeAgeSecs = (state.tunnel.handshakeAgeSecs + 3) % 120;
+        if (state.tunnel.dup) { const n = 300 + Math.round(Math.random() * 100); const lost = Math.round(n * (0.02 + Math.random() * 0.06)); state.tunnel.dup.downPairs += n - lost; state.tunnel.dup.downSingles += lost; state.tunnel.dup.sent += n; state.tunnel.dup.received += 2 * n - lost; }
         return structuredClone(state);
       }
       case "watch_game":
@@ -129,6 +131,8 @@ w.__TAURI_INTERNALS__ = {
       case "unwatch_game": state.watched = state.watched.filter((g: string) => g !== args.exe); return null;
       case "save_settings": if (args.serverUrl) state.gpnServerUrl = args.serverUrl; return null;
       case "ping_server": return "ok";
+      case "set_tray": state.tray = { minimize: args.minimize, close: args.close }; return null;
+      case "hide_to_tray": return null;
       case "set_duplication": state.dup = { enabled: args.enabled, delayMs: args.delayMs }; return null;
       case "dup_server_stats": return [17400, 410];
       case "udp_probe": await new Promise((r) => setTimeout(r, 1200)); return { sent: 200, singleLossPct: 1.5, dupLossPct: 0, avgRttMs: 27.4, jitterMs: 1.2, delayMs: 3 };

@@ -57,6 +57,11 @@
               </div>
               <div class="stats" id="stats"></div>
 
+              <div id="dupCard" style="display:none">
+                <div class="group-title">Packet loss protection <span class="chip plain" id="dupState" style="margin-left:4px"></span></div>
+                <div class="card pad" id="dupBody"></div>
+              </div>
+
               <div class="group-title">Connection path <span class="count" id="pathInfo"></span></div>
               <div class="card pad">
                 <div id="pathDiagram"></div>
@@ -206,9 +211,6 @@
                   <div class="info"><b>Send every packet twice</b><div class="d">Duplicates tunnel packets to your server (it drops the extra copy), so random loss on your connection doesn't reach the game. Needs <code>dupPort</code> enabled on the server. Applies the next time the tunnel starts.</div></div>
                   <div class="ctl"><label class="row small" style="gap:8px"><input type="checkbox" id="dupOn"> Enabled</label></div>
                 </div>
-                <div class="setting" id="dupLiveRow" style="display:none">
-                  <div class="info"><b>Saved so far</b><div class="d" id="dupLive">—</div></div>
-                </div>
                 <div class="setting">
                   <div class="info"><b>Gap between copies</b><div class="d">Milliseconds between the two copies; a few ms helps against bursts.</div></div>
                   <div class="ctl"><input id="dupDelay" type="number" min="0" max="50" style="width:80px" /></div>
@@ -216,6 +218,18 @@
                 <div class="setting">
                   <div class="info"><b>Test UDP loss</b><div class="d" id="dupResult">Sends 200 probes to your server (about 10 s): loss with one copy vs. two.</div></div>
                   <div class="ctl"><button class="btn" id="dupTest">Run test</button></div>
+                </div>
+              </div>
+
+              <div class="group-title">Window</div>
+              <div class="card">
+                <div class="setting">
+                  <div class="info"><b>Minimize to tray</b><div class="d">The minimize button hides GPN to the tray icon instead of the taskbar. Click the tray icon to bring it back.</div></div>
+                  <div class="ctl"><label class="row small" style="gap:8px"><input type="checkbox" id="trayMin"> Enabled</label></div>
+                </div>
+                <div class="setting">
+                  <div class="info"><b>Close button hides to tray</b><div class="d">Keeps GPN (and the tunnel) running when you close the window. Off = closing quits the app. “Quit” in the tray menu always quits.</div></div>
+                  <div class="ctl"><label class="row small" style="gap:8px"><input type="checkbox" id="trayClose"> Enabled</label></div>
                 </div>
               </div>
 
