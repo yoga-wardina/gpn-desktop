@@ -41,6 +41,20 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "publisher": "GPN",
+    "shortDescription": "GPN Client",
+    "longDescription": "GPN Client desktop application",
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "displayLanguageSelector": false,
+        "languages": [
+          "English"
+        ],
+        "startMenuFolder": "GPN Client",
+        "installerIcon": "icons/icon.ico"
+      }
+    }
   }
 }
